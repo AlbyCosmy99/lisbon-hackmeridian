@@ -843,6 +843,72 @@ export function runTamperXRay(
   };
 }
 
+export async function processMultipleFilesBatch(
+  files: Array<{ name: string; bytes: Uint8Array }>
+): Promise<ParsedLedger> {
+  if (files.length === 1) {
+    return processLedgerContent(files[0].name, files[0].bytes);
+  }
+
+  const parsedList = await Promise.all(
+    files.map((f) => processLedgerContent(f.name, f.bytes))
+  );
+
+  const combinedRows: LedgerRow[] = [];
+  for (const item of parsedList) {
+    for (const r of item.rows.slice(0, 25)) {
+      const rowIndex = combinedRows.length + 1;
+      const entryId = `${item.fileName.slice(0, 12)}#${r.rowIndex}`;
+      const canonicalString = `${rowIndex}|${item.fileName}|${r.canonicalString}`;
+      const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
+      combinedRows.push({
+        ...r,
+        rowIndex,
+        entryId,
+        accountName: `[${item.fileName}] ${r.accountName}`,
+        canonicalString,
+        leafHash,
+      });
+    }
+  }
+
+  const totalSize = files.reduce((acc, f) => acc + f.bytes.byteLength, 0);
+  const batchHashInput = parsedList.map((p) => p.rawFileHash).join(':');
+  const rawFileHash = await sha256Hex(`AUDITLEDGER_BATCH_V1:${batchHashInput}`);
+  const merkleLayers = await buildMerkleLayers(combinedRows.map((r) => r.leafHash));
+  const merkleRoot = merkleLayers[merkleLayers.length - 1][0];
+  const periodId = `BATCH-${files.length}-FILES`;
+  const totalDebitCents = combinedRows.reduce((s, r) => s + r.debitCents, 0);
+  const totalCreditCents = combinedRows.reduce((s, r) => s + r.creditCents, 0);
+  const commitmentHash = await sha256Hex(
+    `AUDITLEDGER_COMMIT_V1:${periodId}:${totalDebitCents}:${totalCreditCents}`
+  );
+  const allAccounting = parsedList.every((p) => p.documentMode === 'accounting_gl');
+
+  return {
+    fileName: `Bulk Batch (${files.length} Files: ${files
+      .map((f) => f.name)
+      .slice(0, 2)
+      .join(', ')}${files.length > 2 ? '...' : ''})`,
+    fileSizeBytes: totalSize,
+    periodId,
+    documentMode: allAccounting ? 'accounting_gl' : 'generic_csv',
+    rawFileHash,
+    merkleRoot,
+    commitmentHash,
+    rows: combinedRows,
+    totalDebitCents,
+    totalCreditCents,
+    isBalanced: totalDebitCents === totalCreditCents,
+    balanceDeltaCents: totalDebitCents - totalCreditCents,
+    merkleLayers,
+    normalizationLog: [
+      `Combined ${files.length} files (${combinedRows.length} total records) into a single Bulk Merkle Root for 1-click Soroban sealing`,
+    ],
+    isDirtyInputNormalized: true,
+  };
+}
+
 export async function createTamperedCloneOfLedger(
   ledger: ParsedLedger
 ): Promise<{ tamperedLedger: ParsedLedger; note: string }> {

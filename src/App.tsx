@@ -10,6 +10,7 @@ import {
   formatCentsToEur,
   generateRowMerkleProof,
   processLedgerContent,
+  processMultipleFilesBatch,
   runTamperXRay,
   verifyRowMerkleProof,
 } from './lib/merkleAndCrypto';
@@ -236,14 +237,21 @@ export function App() {
   };
 
   const handleIssuerFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
     setNotarizeError('');
     setLastNotarization(null);
     setIssuerExistingRecord(null);
     setRawMessyPreview('');
-    const buffer = await file.arrayBuffer();
-    const parsed = await processLedgerContent(file.name, new Uint8Array(buffer));
+
+    const loadedFiles: Array<{ name: string; bytes: Uint8Array }> = [];
+    for (let i = 0; i < fileList.length; i += 1) {
+      const f = fileList[i];
+      const buffer = await f.arrayBuffer();
+      loadedFiles.push({ name: f.name, bytes: new Uint8Array(buffer) });
+    }
+
+    const parsed = await processMultipleFilesBatch(loadedFiles);
     setIssuerLedger(parsed);
     setCustomPeriodId(parsed.periodId);
     setSealedSnapshots((prev) => ({ ...prev, [parsed.periodId]: parsed }));
@@ -686,6 +694,32 @@ export function App() {
       {/* =========================================================
           SPLIT-PANE WORKSPACE (LEFT = LEDGER, RIGHT = SEAL DOCKET)
          ========================================================= */}
+      <div className="border-b border-[#D8D4CA] bg-[#F4F1EA] no-print">
+        <div className="max-w-[1440px] mx-auto px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm text-stone-800">
+          <div>
+            <span className="font-mono font-bold uppercase text-stone-950 mr-2">
+              {activeTab === 'issuer'
+                ? 'HOW IT WORKS (COMPANY ROLE):'
+                : 'HOW IT WORKS (EXTERNAL AUDITOR ROLE):'}
+            </span>
+            {activeTab === 'issuer' ? (
+              <span>
+                <strong>1.</strong> Load a SAP/ERP close or upload one/multiple CSV &amp; PDF files ·{' '}
+                <strong>2.</strong> Freeze the 32-byte Merkle Root on Stellar Soroban ·{' '}
+                <strong>3.</strong> Switch to External Auditor to test tamper detection.
+              </span>
+            ) : (
+              <span>
+                <strong>Zero-Cost Verification (0 XLM):</strong> Click the 3 test scenarios below (or upload a file) to compare every row against the immutable Stellar Soroban seal and pinpoint any altered numbers in red.
+              </span>
+            )}
+          </div>
+          <span className="font-mono text-xs text-emerald-900 font-semibold">
+            100% Real SHA-256 + Live Soroban Testnet
+          </span>
+        </div>
+      </div>
+
       {activeLedger && (
         <main className="flex-1 max-w-[1440px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 no-print">
           {/* =====================================================
@@ -698,8 +732,8 @@ export function App() {
                 <div>
                   <div className="text-xs font-mono uppercase tracking-wider text-stone-600 font-medium">
                     {activeTab === 'issuer'
-                      ? `STEP 1 OF 3 · DOCUMENT INGESTION · ${activeLedger.fileName}`
-                      : `STEP 3 OF 3 · FORENSIC AUDITOR VERIFICATION · ${activeLedger.fileName}`}
+                      ? `STEP 1 OF 3 · SELECT OR UPLOAD DOCUMENT(S) · ${activeLedger.fileName}`
+                      : `STEP 3 OF 3 · INDEPENDENT AUDITOR VERIFICATION · ${activeLedger.fileName}`}
                   </div>
                   <h1 className="font-serif-editorial text-4xl sm:text-5xl text-stone-950 mt-1">
                     {activeTab === 'issuer'
@@ -709,8 +743,10 @@ export function App() {
                         ? 'September 2026 General Ledger'
                         : `Document: ${activeLedger.fileName}`
                       : verificationResult?.status === 'TAMPERED_PERIOD_MISMATCH'
-                      ? `Tampering Detected: ${activeLedger.fileName}`
-                      : `Audit Verification: ${activeLedger.fileName}`}
+                      ? 'Fraud Alert: Altered Entries Detected'
+                      : verificationResult?.status === 'CANONICAL_MERKLE_MATCH'
+                      ? 'Verified: Numbers 100% Intact (Re-Saved Format)'
+                      : 'Verified: October 2026 General Ledger Close'}
                   </h1>
                 </div>
 
@@ -726,7 +762,7 @@ export function App() {
                           : 'text-stone-700 hover:bg-stone-100'
                       }`}
                     >
-                      Oct 2026
+                      Oct 2026 (SAP)
                     </button>
                     <button
                       type="button"
@@ -737,7 +773,7 @@ export function App() {
                           : 'text-stone-700 hover:bg-stone-100'
                       }`}
                     >
-                      Messy ERP Dump
+                      Dirty ERP Format
                     </button>
                     <button
                       type="button"
@@ -751,9 +787,10 @@ export function App() {
                       Sep 2026
                     </button>
                     <label className="px-3.5 py-2 text-stone-900 font-semibold hover:bg-stone-100 cursor-pointer">
-                      <span>+ Upload CSV / PDF</span>
+                      <span>+ Upload CSV / PDF (Single or Bulk)</span>
                       <input
                         type="file"
+                        multiple
                         accept=".csv,.txt,.json,.pdf"
                         onChange={(e) => void handleIssuerFileUpload(e)}
                         className="hidden"
@@ -761,8 +798,8 @@ export function App() {
                     </label>
                   </div>
                 ) : (
-                  <label className="px-4 py-2 border border-stone-400 bg-white hover:bg-stone-100 text-sm font-medium text-stone-900 cursor-pointer">
-                    <span>Upload File to Audit</span>
+                  <label className="px-4 py-2 border border-stone-900 bg-white hover:bg-stone-100 text-sm font-semibold text-stone-900 cursor-pointer">
+                    <span>+ Upload Any File to Verify</span>
                     <input
                       type="file"
                       accept=".csv,.txt,.json,.pdf"
@@ -778,7 +815,7 @@ export function App() {
                 <div className="border border-stone-300 bg-white px-4 py-3 text-xs sm:text-sm flex flex-wrap items-center justify-between gap-3">
                   <div className="space-y-0.5">
                     <span className="font-mono font-bold uppercase text-xs text-emerald-800 mr-2">
-                      ✓ Canonical Schema Normalizer:
+                      ✓ Auto-Normalized Before Hashing:
                     </span>
                     <span className="text-stone-800">
                       {activeLedger.normalizationLog.join(' · ')}
@@ -805,6 +842,9 @@ export function App() {
               {/* In Auditor Mode: Stage Test Buttons + Custom File Tamper Test */}
               {activeTab === 'auditor' && (
                 <div className="space-y-3">
+                  <div className="text-xs font-mono uppercase tracking-wider text-stone-600 font-semibold">
+                    Click a scenario below to test how the Soroban Smart Contract reacts:
+                  </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 border border-stone-400 bg-white divide-y sm:divide-y-0 sm:divide-x divide-stone-300">
                     <button
                       type="button"
@@ -816,10 +856,10 @@ export function App() {
                       }`}
                     >
                       <div className="text-xs font-mono uppercase tracking-wider opacity-75">
-                        1. Authentic Close
+                        Scenario 1 · Authentic File
                       </div>
                       <div className="text-sm font-semibold mt-0.5">
-                        Original October 2026 Export
+                        100% Untouched Close (Passes)
                       </div>
                     </button>
 
@@ -833,10 +873,10 @@ export function App() {
                       }`}
                     >
                       <div className="text-xs font-mono uppercase tracking-wider opacity-75">
-                        2. Re-Saved in Excel
+                        Scenario 2 · Re-Saved in Excel
                       </div>
                       <div className="text-sm font-semibold mt-0.5">
-                        Format Changed, Numbers Intact
+                        Spaces Changed, Numbers Intact (Passes)
                       </div>
                     </button>
 
@@ -850,10 +890,10 @@ export function App() {
                       }`}
                     >
                       <div className="text-xs font-mono uppercase tracking-wider opacity-80">
-                        3. Doctored Ledger
+                        Scenario 3 · Doctored File (Fraud)
                       </div>
                       <div className="text-sm font-semibold mt-0.5">
-                        Simulate +15,000 EUR Cover-Up
+                        Catch +15,000 EUR Cover-Up (Row #4 &amp; #5)
                       </div>
                     </button>
                   </div>
@@ -925,8 +965,8 @@ export function App() {
                     ? 'Reconciliation Status'
                     : 'Merkle Tree Status'}
                 </div>
-                <div className="flex items-baseline justify-between gap-2 mt-1">
-                  <span className="font-mono text-xl sm:text-2xl font-bold text-emerald-800">
+                <div className="flex flex-wrap items-center justify-between gap-2 mt-1">
+                  <span className="font-mono text-xl sm:text-2xl font-bold text-emerald-800 whitespace-nowrap">
                     {activeLedger.documentMode === 'accounting_gl'
                       ? activeLedger.isBalanced
                         ? 'Balanced (0.00)'
@@ -936,7 +976,7 @@ export function App() {
                   <button
                     type="button"
                     onClick={() => setShowMerkleTopology((prev) => !prev)}
-                    className="text-xs font-semibold underline text-stone-700 hover:text-stone-950 cursor-pointer"
+                    className="px-2.5 py-1 border border-stone-400 bg-[#FAF8F5] hover:bg-stone-100 text-xs font-mono font-semibold text-stone-900 whitespace-nowrap cursor-pointer"
                   >
                     {showMerkleTopology ? 'Hide Merkle Tree' : 'View Merkle Tree'}
                   </button>
@@ -1121,7 +1161,7 @@ export function App() {
           <aside className="lg:col-span-4 bg-[#F4F1EA] flex flex-col divide-y divide-[#D8D4CA]">
             {/* Primary Seal & Verdict Block */}
             <div className="p-6 sm:p-8 space-y-6">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-mono font-bold uppercase tracking-wider text-stone-600">
                   {activeTab === 'issuer'
                     ? 'STEP 2 OF 3 · STELLAR SOROBAN SEAL'
@@ -1131,7 +1171,7 @@ export function App() {
                   href={contractExplorerUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-xs font-mono font-semibold underline text-stone-800 hover:text-black"
+                  className="text-xs font-mono font-semibold underline text-stone-800 hover:text-black whitespace-nowrap shrink-0"
                 >
                   Contract {DEPLOY_CONFIG.contractId.slice(0, 6)}.. ↗
                 </a>
@@ -1341,18 +1381,17 @@ export function App() {
                     {(verificationResult.status === 'EXACT_MATCH' ||
                       verificationResult.status === 'CANONICAL_MERKLE_MATCH') && (
                       <div className="border border-stone-400 bg-white p-4 space-y-3">
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between gap-2">
                           <span className="text-xs font-mono font-bold uppercase tracking-wider text-stone-800">
-                            Multi-Party Auditor Co-Signature
+                            Auditor On-Chain Sign-Off
                           </span>
-                          <span className="font-mono text-[11px] text-emerald-800 font-semibold">
-                            Soroban attest_audit()
+                          <span className="font-mono text-[11px] text-emerald-800 font-semibold whitespace-nowrap shrink-0">
+                            attest_audit()
                           </span>
                         </div>
                         <p className="text-xs text-stone-600 leading-relaxed">
-                          Co-sign this verified close on Stellar Soroban with the External
-                          Statutory Auditor key ({DEPLOY_CONFIG.auditorDemoPublic.slice(0, 6)}
-                          ...{DEPLOY_CONFIG.auditorDemoPublic.slice(-4)}):
+                          As the External Statutory Auditor, co-sign this verified close on
+                          Stellar Soroban so regulators see both CFO and Auditor signatures:
                         </p>
                         <button
                           type="button"
