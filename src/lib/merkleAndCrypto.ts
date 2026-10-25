@@ -824,10 +824,10 @@ export function runTamperXRay(
         rowIndex: sealedRow.rowIndex,
         entryId: sealedRow.entryId,
         accountName: uploadedRow.accountName || sealedRow.accountName,
-        field: 'Entry ID / Canonical Metadata',
-        sealedValue: sealedRow.canonicalString,
-        uploadedValue: uploadedRow.canonicalString,
-        deltaFormatted: 'Canonical Leaf Mismatch',
+        field: 'Row Content',
+        sealedValue: sealedRow.description,
+        uploadedValue: uploadedRow.description,
+        deltaFormatted: 'Content Modified',
         sealedLeafHash: sealedRow.leafHash,
         uploadedLeafHash: uploadedRow.leafHash,
       });
@@ -840,6 +840,65 @@ export function runTamperXRay(
     uploadedRowCount: uploadedLedger.rows.length,
     modifiedRows,
     intactRowCount,
+  };
+}
+
+export async function editSpecificRowInLedger(
+  ledger: ParsedLedger,
+  targetRowIndex: number,
+  customInput: string
+): Promise<{ tamperedLedger: ParsedLedger; note: string }> {
+  const clonedRows: LedgerRow[] = ledger.rows.map((r) => ({ ...r }));
+  const targetIdx = clonedRows.findIndex((r) => r.rowIndex === targetRowIndex);
+  const idx = targetIdx >= 0 ? targetIdx : 0;
+  const modifiedRow = { ...clonedRows[idx] };
+  let note = '';
+
+  const trimmed = customInput.trim();
+  const parsedNum = Number(trimmed.replace(/[^0-9.-]/g, ''));
+
+  if (
+    ledger.documentMode === 'accounting_gl' &&
+    !Number.isNaN(parsedNum) &&
+    trimmed !== '' &&
+    /^[0-9.,+-]+$/.test(trimmed)
+  ) {
+    const newCents = Math.round(Math.abs(parsedNum) * 100);
+    if (modifiedRow.creditCents > 0 && modifiedRow.debitCents === 0) {
+      modifiedRow.creditCents = newCents;
+    } else {
+      modifiedRow.debitCents = newCents;
+    }
+    modifiedRow.canonicalString = `${modifiedRow.rowIndex}|${modifiedRow.entryId}|${modifiedRow.date}|${modifiedRow.accountCode}|${modifiedRow.debitCents}|${modifiedRow.creditCents}`;
+    note = `Live Tamper Test on "${ledger.fileName}": Row #${modifiedRow.rowIndex} (${modifiedRow.entryId}) amount was changed to ${formatCentsToEur(newCents)} after the document was sealed on Stellar.`;
+  } else {
+    modifiedRow.description = trimmed || `${modifiedRow.description} [EDITED]`;
+    modifiedRow.canonicalString = `${modifiedRow.canonicalString}|EDITED:${modifiedRow.description}`;
+    note = `Live Tamper Test on "${ledger.fileName}": Row #${modifiedRow.rowIndex} (${modifiedRow.entryId}) text was changed to "${modifiedRow.description}" after the document was sealed on Stellar.`;
+  }
+
+  modifiedRow.leafHash = await sha256Hex(
+    `AUDITLEDGER_LEAF_V1:${modifiedRow.canonicalString}`
+  );
+  clonedRows[idx] = modifiedRow;
+
+  const merkleLayers = await buildMerkleLayers(clonedRows.map((r) => r.leafHash));
+  const merkleRoot = merkleLayers[merkleLayers.length - 1][0];
+  const rawFileHash = await sha256Hex(`${ledger.rawFileHash}:LIVE_EDIT:${targetRowIndex}:${trimmed}`);
+  const totalDebitCents = clonedRows.reduce((sum, r) => sum + r.debitCents, 0);
+  const totalCreditCents = clonedRows.reduce((sum, r) => sum + r.creditCents, 0);
+
+  return {
+    tamperedLedger: {
+      ...ledger,
+      rawFileHash,
+      merkleRoot,
+      rows: clonedRows,
+      totalDebitCents,
+      totalCreditCents,
+      merkleLayers,
+    },
+    note,
   };
 }
 
