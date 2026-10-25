@@ -149,7 +149,7 @@ export function normalizeErpDate(rawDate: string): {
   };
 }
 
-function splitCsvLine(line: string, delimiter: ',' | ';'): string[] {
+function splitCsvLine(line: string, delimiter: ',' | ';' | '\t'): string[] {
   const cells: string[] = [];
   let current = '';
   let inQuotes = false;
@@ -268,143 +268,66 @@ export async function processLedgerContent(
   // Cap at header + 100 rows for instant UI and Merkle tree rendering on massive CSV dumps
   const nonEmptyLines = allNonEmptyLines.slice(0, 101);
 
-  let delimiter: ',' | ';' = ',';
+  let delimiter: ',' | ';' | '\t' = ',';
   let isAccountingSchema = false;
 
-  if (nonEmptyLines.length >= 2) {
+  const isPdfFile =
+    fileName.toLowerCase().endsWith('.pdf') ||
+    textContent.slice(0, 16).includes('%PDF');
+  const isJsonFile =
+    fileName.toLowerCase().endsWith('.json') ||
+    (textContent.trim().startsWith('[') && textContent.trim().includes('{'));
+
+  if (!isPdfFile && !isJsonFile && nonEmptyLines.length >= 2) {
     const firstHeader = nonEmptyLines[0].toLowerCase();
+    const tabCount = (firstHeader.match(/\t/g) || []).length;
     const semicolonCount = (firstHeader.match(/;/g) || []).length;
     const commaCount = (firstHeader.match(/,/g) || []).length;
-    if (semicolonCount > commaCount) {
+    if (tabCount > commaCount && tabCount > semicolonCount) {
+      delimiter = '\t';
+    } else if (semicolonCount > commaCount) {
       delimiter = ';';
       normalizationLog.push(
         'Converted semicolon (;) regional ERP field delimiters to canonical schema'
       );
     }
 
-    if (
-      firstHeader.includes('entry_id') ||
-      firstHeader.includes('date') ||
-      firstHeader.includes('debit') ||
-      firstHeader.includes('account') ||
-      firstHeader.includes('id_asiento') ||
-      firstHeader.includes('fecha') ||
-      firstHeader.includes('debe') ||
-      firstHeader.includes('cuenta') ||
-      firstHeader.includes('registrazione') ||
-      firstHeader.includes('dare')
-    ) {
-      looksLikeCsv = true;
-      isAccountingSchema = true;
-    } else if (isCsvExtension || commaCount >= 1 || semicolonCount >= 1) {
+    if (isCsvExtension || commaCount >= 1 || semicolonCount >= 1 || tabCount >= 1) {
       looksLikeCsv = true;
     }
   }
 
   const rows: LedgerRow[] = [];
 
-  if (looksLikeCsv && isAccountingSchema) {
+  if (looksLikeCsv) {
     const rawHeaderCells = splitCsvLine(nonEmptyLines[0], delimiter);
     const headerCells = rawHeaderCells.map((h) =>
       h.toLowerCase().replace(/[^a-z0-9_]/g, '')
     );
 
-    const nonEnglishHeaders = headerCells.filter((h) =>
-      [
-        'id_asiento',
-        'asiento',
-        'fecha',
-        'fecha_contable',
-        'cuenta',
-        'cod_cuenta',
-        'nombre_cuenta',
-        'concepto',
-        'debe_eur',
-        'debe',
-        'haber_eur',
-        'haber',
-        'centro_coste',
-        'numero_registrazione',
-        'data_registrazione',
-        'codice_conto',
-        'dare_eur',
-        'avere_eur',
-      ].includes(h)
-    );
-
-    if (nonEnglishHeaders.length > 0) {
-      normalizationLog.push(
-        `Mapped localized ERP column headers (${rawHeaderCells.slice(0, 4).join(', ')}...) to canonical AuditLedger schema`
-      );
-    }
-
-    const findColIndex = (candidates: string[], fallbackIndex: number): number => {
-      for (const candidate of candidates) {
-        const idx = headerCells.indexOf(candidate);
+    const findSmartCol = (
+      exactMatches: string[],
+      substringMatches: string[],
+      excludeIndices: Set<number>
+    ): number => {
+      for (const candidate of exactMatches) {
+        const idx = headerCells.findIndex(
+          (h, i) => !excludeIndices.has(i) && h === candidate
+        );
         if (idx !== -1) return idx;
       }
-      return fallbackIndex;
+      for (const sub of substringMatches) {
+        const idx = headerCells.findIndex(
+          (h, i) => !excludeIndices.has(i) && h.includes(sub)
+        );
+        if (idx !== -1) return idx;
+      }
+      return -1;
     };
 
-    const idxEntryId = findColIndex(
-      [
-        'entry_id',
-        'entryid',
-        'id',
-        'id_asiento',
-        'asiento',
-        'numero_registrazione',
-        'doc_no',
-      ],
-      0
-    );
-    const idxDate = findColIndex(
-      [
-        'date',
-        'posting_date',
-        'postingdate',
-        'fecha',
-        'fecha_contable',
-        'data',
-        'data_registrazione',
-      ],
-      1
-    );
-    const idxAccountCode = findColIndex(
-      [
-        'account_code',
-        'accountcode',
-        'account',
-        'cuenta',
-        'cod_cuenta',
-        'conto',
-        'codice_conto',
-      ],
-      2
-    );
-    const idxAccountName = findColIndex(
-      [
-        'account_name',
-        'accountname',
-        'name',
-        'nombre_cuenta',
-        'denominacion',
-        'nome_conto',
-      ],
-      3
-    );
-    const idxDescription = findColIndex(
-      [
-        'description',
-        'memo',
-        'narrative',
-        'concepto',
-        'descripcion',
-        'causale',
-      ],
-      4
-    );
-    const idxDebit = findColIndex(
+    const usedCols = new Set<number>();
+
+    const idxDebit = findSmartCol(
       [
         'debit_eur',
         'debit',
@@ -413,10 +336,16 @@ export async function processLedgerContent(
         'debe',
         'dare_eur',
         'dare',
+        'outflow',
+        'withdrawal',
+        'expense',
       ],
-      5
+      ['debit', 'debe', 'dare', 'outflow', 'withdrawal'],
+      usedCols
     );
-    const idxCredit = findColIndex(
+    if (idxDebit !== -1) usedCols.add(idxDebit);
+
+    const idxCredit = findSmartCol(
       [
         'credit_eur',
         'credit',
@@ -425,144 +354,513 @@ export async function processLedgerContent(
         'haber',
         'avere_eur',
         'avere',
+        'inflow',
+        'deposit',
+        'income',
+        'revenue',
       ],
-      6
+      ['credit', 'haber', 'avere', 'inflow', 'deposit'],
+      usedCols
     );
-    const idxCostCenter = findColIndex(
-      ['cost_center', 'costcenter', 'department', 'centro_coste', 'cdc'],
-      7
-    );
+    if (idxCredit !== -1) usedCols.add(idxCredit);
 
-    let normalizedDateCount = 0;
-    let normalizedEuroCurrencyCount = 0;
-    let trimmedWhitespaceCount = 0;
-
-    for (let i = 1; i < nonEmptyLines.length; i += 1) {
-      if (nonEmptyLines[i].includes(' , ') || nonEmptyLines[i].includes(' ; ')) {
-        trimmedWhitespaceCount += 1;
-      }
-      const cells = splitCsvLine(nonEmptyLines[i], delimiter);
-      if (cells.length < 3) continue;
-
-      const rowIndex = rows.length + 1;
-      const entryId = (cells[idxEntryId] ?? `GL-${rowIndex}`).trim();
-      const rawDate = (cells[idxDate] ?? '2026-10-31').trim();
-      const { isoDate: date, wasNormalized: dateWasNormalized } =
-        normalizeErpDate(rawDate);
-      if (dateWasNormalized) {
-        normalizedDateCount += 1;
-      }
-
-      const accountCode = (cells[idxAccountCode] ?? '0000').trim().toUpperCase();
-      const accountName = (cells[idxAccountName] ?? 'General Account').trim();
-      const description = (cells[idxDescription] ?? '').trim();
-
-      const rawDebit = cells[idxDebit] ?? '0';
-      const rawCredit = cells[idxCredit] ?? '0';
-      if (
-        rawDebit.includes(',') ||
-        rawDebit.includes('€') ||
-        rawCredit.includes(',') ||
-        rawCredit.includes('€')
-      ) {
-        normalizedEuroCurrencyCount += 1;
-      }
-
-      const debitCents = parseAmountToCents(rawDebit);
-      const creditCents = parseAmountToCents(rawCredit);
-      const costCenter = (cells[idxCostCenter] ?? 'HQ-LISBON').trim().toUpperCase();
-
-      const canonicalString = `${rowIndex}|${entryId}|${date}|${accountCode}|${debitCents}|${creditCents}`;
-      const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
-
-      rows.push({
-        rowIndex,
-        entryId,
-        date,
-        accountCode,
-        accountName,
-        description,
-        debitCents,
-        creditCents,
-        costCenter,
-        canonicalString,
-        leafHash,
-      });
-    }
-
-    if (normalizedDateCount > 0) {
-      normalizationLog.push(
-        `Converted ${normalizedDateCount} regional DD/MM/YYYY posting dates to ISO-8601 (YYYY-MM-DD)`
+    // Single signed or unsigned Amount column (e.g. "date,description,amount")
+    let idxSingleAmount = -1;
+    if (idxDebit === -1 && idxCredit === -1) {
+      idxSingleAmount = findSmartCol(
+        [
+          'amount',
+          'amount_eur',
+          'amount_usd',
+          'total',
+          'total_eur',
+          'value',
+          'price',
+          'importe',
+          'importo',
+          'monto',
+          'valor',
+          'montant',
+          'betrag',
+          'sum',
+          'net',
+          'gross',
+          'balance',
+          'payment',
+          'cost',
+          'fee',
+        ],
+        ['amount', 'importe', 'importo', 'total', 'price', 'eur', 'usd', 'cost', 'sum', 'balance'],
+        usedCols
       );
+
+      // Even if header is unusual, auto-detect if a column contains signed/decimal currency numbers
+      if (idxSingleAmount === -1 && nonEmptyLines.length >= 2) {
+        const sampleRows = nonEmptyLines
+          .slice(1, Math.min(8, nonEmptyLines.length))
+          .map((l) => splitCsvLine(l, delimiter));
+        for (let col = 0; col < rawHeaderCells.length; col += 1) {
+          const h = headerCells[col] || '';
+          if (h.includes('id') || h.includes('date') || h.includes('year') || h.includes('patent')) {
+            continue;
+          }
+          const numericLookingCount = sampleRows.filter((r) => {
+            const val = (r[col] ?? '').trim();
+            return /^[+-]?[€$£]?\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})$/.test(val);
+          }).length;
+          if (numericLookingCount >= Math.ceil(sampleRows.length * 0.6) && sampleRows.length > 0) {
+            idxSingleAmount = col;
+            break;
+          }
+        }
+      }
+
+      if (idxSingleAmount !== -1) {
+        usedCols.add(idxSingleAmount);
+      }
     }
-    if (normalizedEuroCurrencyCount > 0) {
-      normalizationLog.push(
-        `Parsed ${normalizedEuroCurrencyCount} formatted European currency rows (e.g. 145.000,00 EUR) into exact integer cents`
+
+    // It is an accounting/financial CSV if and only if it has Debit, Credit, or Amount column!
+    if (idxDebit !== -1 || idxCredit !== -1 || idxSingleAmount !== -1) {
+      isAccountingSchema = true;
+    }
+
+    if (isAccountingSchema) {
+      const idxDate = findSmartCol(
+        [
+          'date',
+          'posting_date',
+          'postingdate',
+          'transaction_date',
+          'fecha',
+          'fecha_contable',
+          'data',
+          'data_registrazione',
+          'timestamp',
+        ],
+        ['date', 'fecha', 'data', 'time'],
+        usedCols
       );
-    }
-    if (trimmedWhitespaceCount > 0) {
-      normalizationLog.push(
-        `Stripped padded spreadsheet whitespace across ${trimmedWhitespaceCount} rows`
+      if (idxDate !== -1) usedCols.add(idxDate);
+
+      const idxEntryId = findSmartCol(
+        [
+          'entry_id',
+          'entryid',
+          'id',
+          'tx_id',
+          'transaction_id',
+          'id_asiento',
+          'asiento',
+          'numero_registrazione',
+          'doc_no',
+          'invoice_id',
+          'invoice',
+          'reference',
+          'ref',
+        ],
+        ['entry_id', 'tx_id', 'asiento', 'registrazione', 'invoice', 'ref'],
+        usedCols
       );
-    }
-  } else if (looksLikeCsv) {
-    // Generic CSV dataset (any custom uploaded CSV file)
-    const rawHeaderCells = splitCsvLine(nonEmptyLines[0], delimiter);
-    normalizationLog.push(
-      `Ingested custom CSV schema (${rawHeaderCells.slice(0, 4).join(', ')}) into Merkle leaf tree`
-    );
+      if (idxEntryId !== -1) usedCols.add(idxEntryId);
 
-    const todayIso = new Date().toISOString().slice(0, 10);
-    for (let i = 1; i < Math.min(nonEmptyLines.length, 51); i += 1) {
-      const cells = splitCsvLine(nonEmptyLines[i], delimiter);
-      if (cells.length === 0 || cells.every((c) => !c)) continue;
+      const idxDescription = findSmartCol(
+        [
+          'description',
+          'memo',
+          'narrative',
+          'concepto',
+          'descripcion',
+          'causale',
+          'details',
+          'item',
+          'title',
+          'note',
+          'notes',
+          'subject',
+          'merchant',
+          'payee',
+        ],
+        ['desc', 'memo', 'concept', 'causal', 'detail', 'title', 'note', 'merchant', 'item'],
+        usedCols
+      );
+      if (idxDescription !== -1) usedCols.add(idxDescription);
 
-      const rowIndex = rows.length + 1;
-      const col0 = (cells[0] ?? '').trim();
-      const col1 = (cells[1] ?? '').trim();
-      const col2 = (cells[2] ?? '').trim();
-      const col3 = (cells[3] ?? '').trim();
+      const idxAccountCode = findSmartCol(
+        [
+          'account_code',
+          'accountcode',
+          'account',
+          'cuenta',
+          'cod_cuenta',
+          'conto',
+          'codice_conto',
+          'category',
+          'type',
+          'code',
+          'gl_code',
+        ],
+        ['account_code', 'cod_cuenta', 'codice_conto', 'category', 'type', 'code'],
+        usedCols
+      );
+      if (idxAccountCode !== -1) usedCols.add(idxAccountCode);
 
-      const entryId =
-        col0 && col0.length <= 24
-          ? col0
-          : `ROW-${String(rowIndex).padStart(4, '0')}`;
-      const dateMatch = nonEmptyLines[i].match(/(20\d{2}-\d{2}-\d{2})/);
-      const date = dateMatch ? dateMatch[1] : todayIso;
-      const accountCode = (rawHeaderCells[1] || 'CSV-COL1')
-        .toUpperCase()
-        .replace(/[^A-Z0-9_-]/g, '')
-        .slice(0, 12);
-      const accountName =
-        (col1 || col0 || `Dataset Record #${rowIndex}`).slice(0, 65);
-      const description =
-        cells
-          .slice(2, 6)
+      const idxAccountName = findSmartCol(
+        [
+          'account_name',
+          'accountname',
+          'name',
+          'nombre_cuenta',
+          'denominacion',
+          'nome_conto',
+          'vendor',
+          'client',
+          'counterparty',
+        ],
+        ['account_name', 'nombre_cuenta', 'nome_conto', 'vendor', 'client', 'counterparty', 'name'],
+        usedCols
+      );
+      if (idxAccountName !== -1) usedCols.add(idxAccountName);
+
+      const idxCostCenter = findSmartCol(
+        ['cost_center', 'costcenter', 'department', 'centro_coste', 'cdc', 'project'],
+        ['cost_center', 'centro_coste', 'department', 'cdc'],
+        usedCols
+      );
+      if (idxCostCenter !== -1) usedCols.add(idxCostCenter);
+
+      // Check if single-amount column has both negative and positive values, or only positive values
+      let singleAmountHasNegatives = false;
+      if (idxSingleAmount !== -1) {
+        for (let i = 1; i < nonEmptyLines.length; i += 1) {
+          const c = splitCsvLine(nonEmptyLines[i], delimiter);
+          const val = parseAmountToCents(c[idxSingleAmount] ?? '0');
+          if (val < 0) {
+            singleAmountHasNegatives = true;
+            break;
+          }
+        }
+      }
+
+      let normalizedDateCount = 0;
+      let normalizedEuroCurrencyCount = 0;
+      let trimmedWhitespaceCount = 0;
+
+      for (let i = 1; i < nonEmptyLines.length; i += 1) {
+        if (nonEmptyLines[i].includes(' , ') || nonEmptyLines[i].includes(' ; ')) {
+          trimmedWhitespaceCount += 1;
+        }
+        const cells = splitCsvLine(nonEmptyLines[i], delimiter);
+        if (cells.length === 0 || cells.every((c) => !c.trim())) continue;
+
+        const rowIndex = rows.length + 1;
+        const rawDate =
+          idxDate !== -1 && cells[idxDate]
+            ? cells[idxDate].trim()
+            : '2026-10-31';
+        const { isoDate: date, wasNormalized: dateWasNormalized } =
+          normalizeErpDate(rawDate);
+        if (dateWasNormalized) {
+          normalizedDateCount += 1;
+        }
+
+        const entryId =
+          idxEntryId !== -1 && cells[idxEntryId]?.trim()
+            ? cells[idxEntryId].trim()
+            : `TXN-${String(rowIndex).padStart(4, '0')}`;
+
+        let debitCents = 0;
+        let creditCents = 0;
+
+        if (idxSingleAmount !== -1) {
+          const rawAmt = cells[idxSingleAmount] ?? '0';
+          if (rawAmt.includes(',') || rawAmt.includes('€') || rawAmt.includes('$')) {
+            normalizedEuroCurrencyCount += 1;
+          }
+          const signedCents = parseAmountToCents(rawAmt);
+          const rowCategoryText =
+            (idxAccountCode !== -1 ? cells[idxAccountCode] : '')?.toLowerCase() || '';
+
+          if (singleAmountHasNegatives) {
+            // Standard bank/cashflow CSV convention (e.g. date,description,amount):
+            // Negative (-299.01) = Outflow / Expense (Debit)
+            // Positive (+6500.00) = Inflow / Revenue (Credit)
+            if (signedCents < 0) {
+              debitCents = Math.abs(signedCents);
+            } else {
+              creditCents = signedCents;
+            }
+          } else if (
+            rowCategoryText.includes('credit') ||
+            rowCategoryText.includes('income') ||
+            rowCategoryText.includes('revenue') ||
+            rowCategoryText.includes('inflow') ||
+            rowCategoryText === 'cr'
+          ) {
+            creditCents = Math.abs(signedCents);
+          } else {
+            debitCents = Math.abs(signedCents);
+          }
+        } else {
+          const rawDebit = idxDebit !== -1 ? cells[idxDebit] ?? '0' : '0';
+          const rawCredit = idxCredit !== -1 ? cells[idxCredit] ?? '0' : '0';
+          if (
+            rawDebit.includes(',') ||
+            rawDebit.includes('€') ||
+            rawCredit.includes(',') ||
+            rawCredit.includes('€')
+          ) {
+            normalizedEuroCurrencyCount += 1;
+          }
+          debitCents = Math.abs(parseAmountToCents(rawDebit));
+          creditCents = Math.abs(parseAmountToCents(rawCredit));
+        }
+
+        const rawDesc =
+          idxDescription !== -1 && cells[idxDescription]?.trim()
+            ? cells[idxDescription].trim()
+            : '';
+
+        const unmappedInfo = cells
+          .map((val, cIdx) =>
+            !usedCols.has(cIdx) && val.trim()
+              ? `${rawHeaderCells[cIdx] || `Col ${cIdx + 1}`}: ${val.trim()}`
+              : ''
+          )
           .filter(Boolean)
-          .join(' · ')
-          .slice(0, 110) ||
-        col2 ||
-        col3 ||
-        `Custom CSV Row #${rowIndex}`;
+          .join(' · ');
 
-      // Deterministic balanced value or parsed numeric column so the dataset reconciles cleanly
-      const canonicalString = `${rowIndex}|${entryId}|${date}|${accountCode}|${accountName}|${description}`;
+        const accountCode =
+          idxAccountCode !== -1 && cells[idxAccountCode]?.trim()
+            ? cells[idxAccountCode].trim().toUpperCase().slice(0, 14)
+            : debitCents > 0 && creditCents === 0
+            ? idxSingleAmount !== -1
+              ? 'EXPENSE'
+              : 'DEBIT'
+            : creditCents > 0
+            ? idxSingleAmount !== -1
+              ? 'INFLOW'
+              : 'CREDIT'
+            : 'ENTRY';
+
+        const accountName =
+          idxAccountName !== -1 && cells[idxAccountName]?.trim()
+            ? cells[idxAccountName].trim()
+            : rawDesc || unmappedInfo || `Financial Entry #${rowIndex}`;
+
+        const description =
+          idxAccountName !== -1 && rawDesc
+            ? rawDesc
+            : unmappedInfo ||
+              (debitCents > 0
+                ? `Recorded Outflow / Debit (${formatCentsToEur(debitCents)})`
+                : creditCents > 0
+                ? `Recorded Inflow / Credit (${formatCentsToEur(creditCents)})`
+                : `Recorded Entry on ${date}`);
+
+        const costCenter =
+          idxCostCenter !== -1 && cells[idxCostCenter]?.trim()
+            ? cells[idxCostCenter].trim().toUpperCase()
+            : 'GENERAL';
+
+        const canonicalString = `${rowIndex}|${entryId}|${date}|${accountCode}|${accountName}|${description}|${debitCents}|${creditCents}`;
+        const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
+
+        rows.push({
+          rowIndex,
+          entryId,
+          date,
+          accountCode,
+          accountName,
+          description,
+          debitCents,
+          creditCents,
+          costCenter,
+          canonicalString,
+          leafHash,
+        });
+      }
+
+      if (normalizedDateCount > 0) {
+        normalizationLog.push(
+          `Converted ${normalizedDateCount} regional DD/MM/YYYY dates to ISO-8601 (YYYY-MM-DD)`
+        );
+      }
+      if (normalizedEuroCurrencyCount > 0) {
+        normalizationLog.push(
+          `Parsed ${normalizedEuroCurrencyCount} formatted currency rows into exact integer cents`
+        );
+      }
+      if (trimmedWhitespaceCount > 0) {
+        normalizationLog.push(
+          `Stripped padded spreadsheet whitespace across ${trimmedWhitespaceCount} rows`
+        );
+      }
+    } else {
+      // Generic CSV dataset (any non-financial CSV file like patents, inventory, logs, CRM)
+      normalizationLog.push(
+        `Ingested custom CSV schema (${rawHeaderCells.slice(0, 4).join(', ')}) into Merkle leaf tree`
+      );
+
+      const todayIso = new Date().toISOString().slice(0, 10);
+      for (let i = 1; i < Math.min(nonEmptyLines.length, 61); i += 1) {
+        const cells = splitCsvLine(nonEmptyLines[i], delimiter);
+        if (cells.length === 0 || cells.every((c) => !c)) continue;
+
+        const rowIndex = rows.length + 1;
+        const col0 = (cells[0] ?? '').trim();
+        const col1 = (cells[1] ?? '').trim();
+        const col2 = (cells[2] ?? '').trim();
+
+        const entryId =
+          col0 && col0.length <= 24
+            ? col0
+            : `ROW-${String(rowIndex).padStart(4, '0')}`;
+        const dateMatch = nonEmptyLines[i].match(/(20\d{2}-\d{2}-\d{2})/);
+        const date = dateMatch ? dateMatch[1] : todayIso;
+        const accountCode = (rawHeaderCells[1] || rawHeaderCells[0] || 'RECORD')
+          .toUpperCase()
+          .replace(/[^A-Z0-9_-]/g, '')
+          .slice(0, 14);
+        const accountName =
+          (col1 || col0 || `Dataset Record #${rowIndex}`).slice(0, 75);
+        const description =
+          cells
+            .slice(2, 7)
+            .map((c, idx) => {
+              const val = c.trim();
+              if (!val) return '';
+              const hName = rawHeaderCells[idx + 2];
+              return hName ? `${hName}: ${val}` : val;
+            })
+            .filter(Boolean)
+            .join(' · ')
+            .slice(0, 140) ||
+          col2 ||
+          `Custom CSV Row #${rowIndex}`;
+
+        const canonicalString = `${rowIndex}|${entryId}|${date}|${accountCode}|${accountName}|${description}`;
+        const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
+
+        rows.push({
+          rowIndex,
+          entryId,
+          date,
+          accountCode,
+          accountName,
+          description,
+          debitCents: 0,
+          creditCents: 0,
+          costCenter: 'CUSTOM-CSV',
+          canonicalString,
+          leafHash,
+        });
+      }
+    }
+  } else if (isJsonFile) {
+    // Dynamic JSON array / object parser
+    try {
+      const parsedJson = JSON.parse(textContent);
+      const items: Array<Record<string, unknown>> = Array.isArray(parsedJson)
+        ? parsedJson
+        : Array.isArray(parsedJson.records || parsedJson.data || parsedJson.items || parsedJson.rows)
+        ? (parsedJson.records || parsedJson.data || parsedJson.items || parsedJson.rows)
+        : [parsedJson];
+
+      const todayIso = new Date().toISOString().slice(0, 10);
+      for (let i = 0; i < Math.min(items.length, 60); i += 1) {
+        const obj = items[i] || {};
+        const keys = Object.keys(obj);
+        const rowIndex = rows.length + 1;
+        const entryId = String(
+          obj.id ?? obj.entry_id ?? obj.tx_id ?? `JSON-${String(rowIndex).padStart(4, '0')}`
+        ).slice(0, 24);
+        const date = String(obj.date ?? obj.timestamp ?? todayIso).slice(0, 10);
+        const rawAmt = obj.amount ?? obj.total ?? obj.price ?? obj.debit ?? 0;
+        const cents = parseAmountToCents(String(rawAmt));
+        if (cents !== 0) isAccountingSchema = true;
+        const debitCents = cents < 0 ? Math.abs(cents) : cents > 0 && !obj.credit ? cents : 0;
+        const creditCents = obj.credit ? Math.abs(parseAmountToCents(String(obj.credit))) : 0;
+        const accountCode = String(obj.type ?? obj.category ?? obj.account ?? 'JSON').toUpperCase().slice(0, 12);
+        const accountName = String(obj.description ?? obj.name ?? obj.title ?? keys.slice(0, 2).map((k) => `${k}: ${String(obj[k])}`).join(' · ')).slice(0, 75);
+        const description = keys
+          .slice(0, 5)
+          .map((k) => `${k}: ${String(obj[k])}`)
+          .join(' · ')
+          .slice(0, 140);
+        const canonicalString = `${rowIndex}|${entryId}|${date}|${accountCode}|${accountName}|${description}|${debitCents}|${creditCents}`;
+        const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
+        rows.push({
+          rowIndex,
+          entryId,
+          date,
+          accountCode,
+          accountName,
+          description,
+          debitCents,
+          creditCents,
+          costCenter: 'JSON-DATA',
+          canonicalString,
+          leafHash,
+        });
+      }
+      looksLikeCsv = true;
+    } catch {
+      // Fallback to binary/chunk mode below
+    }
+  } else if (isPdfFile) {
+    // Dynamic Multi-Section PDF Document Extractor:
+    // Extracts readable text clauses / page markers AND creates verifiable cryptographic sections
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const extractedStrings: string[] = [];
+    const literalRegex = /\(([^()\\]{6,120})\)/g;
+    let match: RegExpExecArray | null = literalRegex.exec(textContent);
+    while (match && extractedStrings.length < 30) {
+      const cleaned = match[1].replace(/[^\x20-\x7E]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (
+        cleaned.length >= 6 &&
+        !/^(Identity|Adobe|Mac OS|PDF| FlateDecode|Font|Type|Pages)/i.test(cleaned)
+      ) {
+        extractedStrings.push(cleaned);
+      }
+      match = literalRegex.exec(textContent);
+    }
+
+    // Divide the PDF into deterministic verifiable chunks (up to 16 sections) so every page/block has its own Merkle leaf!
+    const targetChunkCount = Math.max(
+      1,
+      Math.min(16, Math.ceil(rawBytes.byteLength / 8192))
+    );
+    const chunkSize = Math.ceil(rawBytes.byteLength / targetChunkCount);
+
+    for (let c = 0; c < targetChunkCount; c += 1) {
+      const start = c * chunkSize;
+      const end = Math.min(rawBytes.byteLength, start + chunkSize);
+      const chunkBytes = rawBytes.subarray(start, end);
+      const chunkHash = await sha256Hex(chunkBytes);
+      const rowIndex = c + 1;
+      const entryId = `PDF-SEC-${String(rowIndex).padStart(2, '0')}`;
+      const snippet = extractedStrings[c]
+        ? `Extracted Text: "${extractedStrings[c].slice(0, 85)}"`
+        : `Cryptographic PDF Block (Bytes ${start.toLocaleString()} - ${end.toLocaleString()} · SHA-256: ${chunkHash.slice(0, 12)}...)`;
+      const canonicalString = `${rowIndex}|${entryId}|${todayIso}|PDF-BLOCK|${chunkHash}|${start}-${end}`;
       const leafHash = await sha256Hex(`AUDITLEDGER_LEAF_V1:${canonicalString}`);
 
       rows.push({
         rowIndex,
         entryId,
-        date,
-        accountCode,
-        accountName,
-        description,
+        date: todayIso,
+        accountCode: 'PDF-SECTION',
+        accountName: `${fileName} - Section #${rowIndex} (${((end - start) / 1024).toFixed(1)} KB)`,
+        description: snippet,
         debitCents: 0,
         creditCents: 0,
-        costCenter: 'CUSTOM-CSV',
+        costCenter: 'PDF-SEAL',
         canonicalString,
         leafHash,
       });
     }
+    looksLikeCsv = true;
   }
 
   if (rows.length === 0) {
@@ -984,8 +1282,8 @@ export async function createTamperedCloneOfLedger(
 
   if (modifiedRow.debitCents > 0 || modifiedRow.creditCents > 0) {
     modifiedRow.debitCents += 1500000;
-    modifiedRow.canonicalString = `${modifiedRow.rowIndex}|${modifiedRow.entryId}|${modifiedRow.date}|${modifiedRow.accountCode}|${modifiedRow.debitCents}|${modifiedRow.creditCents}`;
-    note = `Simulated retroactive tampering on "${ledger.fileName}": Row #${modifiedRow.rowIndex} (${modifiedRow.entryId}) inflated by +EUR 15,000.00 after the document was sealed.`;
+    modifiedRow.canonicalString = `${modifiedRow.rowIndex}|${modifiedRow.entryId}|${modifiedRow.date}|${modifiedRow.accountCode}|${modifiedRow.accountName}|${modifiedRow.description}|${modifiedRow.debitCents}|${modifiedRow.creditCents}`;
+    note = `Simulated retroactive tampering on "${ledger.fileName}": Row #${modifiedRow.rowIndex} (${modifiedRow.entryId} - ${modifiedRow.accountName}) inflated by +EUR 15,000.00 after the document was sealed.`;
   } else {
     modifiedRow.description = `${modifiedRow.description} [UNAUTHORIZED_EDIT]`;
     modifiedRow.canonicalString = `${modifiedRow.canonicalString}|TAMPERED`;

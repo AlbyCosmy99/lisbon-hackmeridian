@@ -648,15 +648,15 @@ export function App() {
             <button
               type="button"
               onClick={() => setShowWalletMenu((prev) => !prev)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 border border-[#D8D4CA] bg-[#FAF8F5] hover:bg-stone-100 text-xs font-mono text-stone-800 cursor-pointer whitespace-nowrap"
+              className="flex items-center gap-2 px-2.5 py-1.5 border border-stone-400 bg-[#FAF8F5] hover:bg-stone-100 text-xs font-mono text-stone-900 cursor-pointer whitespace-nowrap"
             >
               <span className="w-2 h-2 rounded-full bg-emerald-600 shrink-0" />
               <span>
-                {signerMode === 'freighter' ? 'Wallet: ' : 'Testnet: '}
+                {signerMode === 'freighter' ? 'Wallet: ' : 'Demo Key: '}
                 {activeSignerPub.slice(0, 4)}..{activeSignerPub.slice(-4)}
               </span>
-              <span className="text-stone-500 font-semibold hidden xl:inline">
-                ({xlmBalance} XLM)
+              <span className="px-1.5 py-0.5 bg-emerald-100 border border-emerald-300 text-emerald-950 font-bold">
+                {xlmBalance} XLM
               </span>
             </button>
 
@@ -1503,6 +1503,23 @@ export function App() {
                         <span className="font-mono text-stone-900">
                           {activeSignerPub.slice(0, 6)}...{activeSignerPub.slice(-6)}
                         </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-stone-600">Available XLM Balance</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono font-bold text-emerald-900 bg-emerald-50 px-2 py-0.5 border border-emerald-300 text-xs">
+                            {xlmBalance} XLM
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isFundingWallet}
+                            onClick={() => void handleFundCurrentWallet()}
+                            className="font-mono text-[11px] font-semibold underline text-stone-700 hover:text-stone-950 cursor-pointer"
+                            title="Get 10,000 free Testnet XLM from Stellar Friendbot"
+                          >
+                            {isFundingWallet ? 'Funding...' : '+10k Free'}
+                          </button>
+                        </div>
                       </div>
                       <div className="flex justify-between gap-2">
                         <span className="text-stone-600">Blockchain Network</span>
