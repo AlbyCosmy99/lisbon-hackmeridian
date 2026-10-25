@@ -77,27 +77,26 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
       <div className="flex flex-wrap items-baseline justify-between gap-3 border-b border-[#E2DFD7] pb-3">
         <div>
           <span className="text-[11px] font-mono uppercase tracking-widest text-stone-500">
-            Cryptographic Topology / Binary Merkle Tree
+            Row-by-Row Protection Map (Merkle Tree)
           </span>
           <p className="text-xs text-stone-600 mt-0.5">
-            Select any leaf (`L01` - `L10`) to trace its `O(log N)` verification path to the
-            Soroban root without exposing sibling entries.
+            Click any row box below to see how its individual digital fingerprint connects to the master seal on Stellar.
           </p>
         </div>
 
         <div className="flex items-center gap-4 text-[11px] font-mono">
           <span className="flex items-center gap-1.5 text-stone-900">
             <span className="w-2 h-2 bg-stone-900 inline-block" />
-            <span>ACTIVE PATH</span>
+            <span>SELECTED ROW PATH</span>
           </span>
           <span className="flex items-center gap-1.5 text-amber-800">
             <span className="w-2 h-2 bg-amber-600 inline-block" />
-            <span>PROOF SIBLING</span>
+            <span>PAIRED NEIGHBOR</span>
           </span>
           {hasTampering && (
             <span className="flex items-center gap-1.5 text-red-700 font-semibold">
               <span className="w-2 h-2 bg-red-600 inline-block" />
-              <span>CORRUPTED PATH</span>
+              <span>MODIFIED ROW</span>
             </span>
           )}
         </div>
@@ -127,10 +126,10 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                 <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-stone-500 mb-1">
                   <span className={isRootCorrupted ? 'text-red-700 font-semibold' : 'text-stone-700 font-semibold'}>
                     {isRootCorrupted
-                      ? 'ROOT MISMATCH - COMPUTED MERKLE ROOT DIFFERS FROM SOROBAN SEAL'
-                      : `L${levelIndex} ROOT - ANCHORED ON STELLAR SOROBAN`}
+                      ? 'SEAL MISMATCH - THIS FILE DIFFERS FROM THE STELLAR BLOCKCHAIN RECORD'
+                      : 'MASTER DIGITAL FINGERPRINT - LOCKED ON STELLAR BLOCKCHAIN'}
                   </span>
-                  <span>256-BIT DIGEST</span>
+                  <span>256-BIT SEAL</span>
                 </div>
                 <div className="break-all text-[11px]">{rootHash}</div>
               </div>
