@@ -76,11 +76,11 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
     <div className="border-t border-[#E2DFD7] bg-[#F5F2EB] px-6 py-5 space-y-4">
       <div className="flex flex-wrap items-baseline justify-between gap-3 border-b border-[#E2DFD7] pb-3">
         <div>
-          <span className="text-[11px] font-mono uppercase tracking-widest text-stone-500">
-            Row-by-Row Protection Map (Merkle Tree)
+          <span className="text-[11px] font-mono uppercase tracking-widest text-stone-600 font-bold">
+            Row-by-Row Protection Map
           </span>
           <p className="text-xs text-stone-600 mt-0.5">
-            Click any row box below to see how its individual digital fingerprint connects to the master seal on Stellar.
+            Every row has its own digital fingerprint. They combine in pairs up to one Master Digital Seal on Stellar. Click any row below to trace its protection path.
           </p>
         </div>
 
@@ -127,9 +127,9 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                   <span className={isRootCorrupted ? 'text-red-700 font-semibold' : 'text-stone-700 font-semibold'}>
                     {isRootCorrupted
                       ? 'SEAL MISMATCH - THIS FILE DIFFERS FROM THE STELLAR BLOCKCHAIN RECORD'
-                      : 'MASTER DIGITAL FINGERPRINT - LOCKED ON STELLAR BLOCKCHAIN'}
+                      : 'MASTER DIGITAL SEAL - LOCKED ON STELLAR BLOCKCHAIN'}
                   </span>
-                  <span>256-BIT SEAL</span>
+                  <span>MASTER SEAL</span>
                 </div>
                 <div className="break-all text-[11px]">{rootHash}</div>
               </div>
@@ -142,7 +142,7 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                 key={`lvl-${levelIndex}`}
                 className="grid grid-cols-2 sm:grid-cols-5 border-t border-l border-[#D8D4CA]"
               >
-                {nodes.map((nodeHash, nodeIdx) => {
+                {nodes.slice(0, 25).map((nodeHash, nodeIdx) => {
                   const isCorrupted =
                     treeMetadata.corruptedByLevel[levelIndex]?.has(nodeIdx);
                   const isOnPath =
@@ -166,14 +166,14 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                     >
                       <div className="flex items-center justify-between text-[9px] uppercase tracking-wider mb-0.5">
                         <span>
-                          N{levelIndex}.{nodeIdx + 1}
+                          GROUP {levelIndex}.{nodeIdx + 1}
                         </span>
                         {isCorrupted ? (
-                          <span className="text-red-700 font-bold">INVALID</span>
+                          <span className="text-red-700 font-bold">CHANGED</span>
                         ) : isSibling ? (
-                          <span className="text-amber-800 font-semibold">SIBLING</span>
+                          <span className="text-amber-800 font-semibold">PAIRED</span>
                         ) : isOnPath ? (
-                          <span className="text-stone-300">PATH</span>
+                          <span className="text-stone-300">LINKED</span>
                         ) : null}
                       </div>
                       <div className="truncate">
@@ -191,7 +191,7 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
               key={`lvl-0`}
               className="grid grid-cols-2 sm:grid-cols-5 border-t border-l border-[#D8D4CA]"
             >
-              {ledger.rows.map((row, leafIdx) => {
+              {ledger.rows.slice(0, 25).map((row, leafIdx) => {
                 const isCorrupted = tamperedRowSet.has(leafIdx);
                 const isSelected = row.rowIndex === selectedRowIndex;
 
@@ -210,11 +210,11 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                   >
                     <div className="flex items-center justify-between text-[10px] font-mono">
                       <span className="font-semibold">
-                        L{String(row.rowIndex).padStart(2, '0')} · {row.entryId.replace('GL-2026-', '')}
+                        Row #{String(row.rowIndex).padStart(2, '0')}
                       </span>
                       {isCorrupted && (
                         <span className="text-[9px] font-bold text-red-700 uppercase">
-                          ALTERED
+                          MODIFIED
                         </span>
                       )}
                     </div>
@@ -234,9 +234,11 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
                           : 'text-stone-900'
                       }`}
                     >
-                      {row.debitCents > 0
-                        ? formatCentsToEur(row.debitCents)
-                        : formatCentsToEur(row.creditCents)}
+                      {ledger.documentMode === 'accounting_gl'
+                        ? row.debitCents > 0
+                          ? formatCentsToEur(row.debitCents)
+                          : formatCentsToEur(row.creditCents)
+                        : `Seal: ${row.leafHash.slice(0, 8)}..`}
                     </div>
                   </button>
                 );
