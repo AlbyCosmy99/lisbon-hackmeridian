@@ -597,8 +597,15 @@ export function App() {
             <button
               type="button"
               onClick={() => {
-                if (issuerLedger && !auditorLedger) {
-                  void handleProceedToAuditorStep3(false);
+                if (
+                  issuerLedger &&
+                  (!auditorLedger ||
+                    verificationResult?.status === 'NOT_FOUND' ||
+                    auditorLedger.periodId === issuerLedger.periodId)
+                ) {
+                  void handleProceedToAuditorStep3(
+                    auditorScenario === 'tampered_fraud'
+                  );
                 } else {
                   setActiveTab('auditor');
                 }
@@ -752,7 +759,7 @@ export function App() {
           ONBOARDING & EMPTY STATE (WHEN NO FILE IS LOADED YET)
          ========================================================= */}
       {!activeLedger && (
-        <main className="flex-1 max-w-[1440px] w-full mx-auto px-6 py-8 space-y-6 no-print">
+        <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-8 pb-20 space-y-6 no-print">
           {/* 1. ULTRA-CLEAR PROBLEM, TARGET & 3-STEP FLOW */}
           <div className="bg-white border border-[#D8D4CA] p-6 sm:p-8 space-y-6">
             <div className="flex flex-wrap items-start justify-between gap-4 border-b border-stone-200 pb-5">
@@ -921,11 +928,11 @@ export function App() {
           ACTIVE WORKSPACE: LEFT = TABLE, RIGHT = BLOCKCHAIN SEAL
          ========================================================= */}
       {activeLedger && (
-        <main className="flex-1 max-w-[1440px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 items-start no-print">
+        <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-6 pb-20 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start no-print">
           {/* =====================================================
               LEFT 8 COLS: GUIDED ACTION BANNER + READ-ONLY TABLE
              ===================================================== */}
-          <section className="lg:col-span-8 border-b lg:border-b-0 lg:border-r border-[#D8D4CA] flex flex-col bg-white">
+          <section className="lg:col-span-8 border border-[#D8D4CA] flex flex-col bg-white shadow-2xs">
             {/* Document Title & Upload Button */}
             <div className="px-6 sm:px-8 py-5 border-b border-[#D8D4CA] bg-[#FAF8F5] space-y-4">
               {/* COMPACT 3-STEP PROGRESS BAR SO USER ALWAYS KNOWS WHERE THEY ARE */}
@@ -1282,7 +1289,7 @@ export function App() {
             </div>
 
             {/* Clean Read-Only Data Table */}
-            <div className="overflow-x-auto overflow-y-auto max-h-[520px] bg-white">
+            <div className="overflow-x-auto overflow-y-auto max-h-[520px] pb-4 bg-white">
               <table className="w-full text-left border-collapse">
                 <thead className="sticky top-0 z-10 bg-stone-100 border-b border-[#D8D4CA]">
                   <tr className="text-xs font-semibold uppercase tracking-wider text-stone-700">
@@ -1424,12 +1431,22 @@ export function App() {
                 </tbody>
               </table>
             </div>
+
+            {/* Table Bottom Breathing Strip */}
+            <div className="px-6 sm:px-8 py-3.5 border-t border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-stone-500">
+              <span>
+                Showing {filteredRows.length} of {activeLedger.rows.length} protected rows
+              </span>
+              <span>
+                100% Client-Side SHA-256 Row Indexing · Click any row to inspect proof
+              </span>
+            </div>
           </section>
 
           {/* =====================================================
               RIGHT 4 COLS: STICKY BLOCKCHAIN SEAL & VERDICT PANEL
              ===================================================== */}
-          <aside className="lg:col-span-4 lg:sticky lg:top-16 bg-[#F4F1EA] flex flex-col divide-y divide-[#D8D4CA]">
+          <aside className="lg:col-span-4 lg:sticky lg:top-20 border border-[#D8D4CA] bg-[#F4F1EA] flex flex-col divide-y divide-[#D8D4CA] shadow-2xs">
             <div className="p-6 sm:p-8 space-y-6">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-mono font-bold uppercase tracking-wider text-stone-600">
@@ -1817,6 +1834,27 @@ export function App() {
           </aside>
         </main>
       )}
+
+      {/* =========================================================
+          CLEAN ARCHITECTURAL FOOTER FOR BOTTOM BREATHING ROOM
+         ========================================================= */}
+      <footer className="mt-auto border-t border-[#D8D4CA] bg-white py-5 px-4 sm:px-6 no-print">
+        <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-4 text-xs font-mono text-stone-500">
+          <div>
+            AuditLedger · Tamper-Proof Document Seal on Stellar Testnet · 100% Client-Side Privacy
+          </div>
+          <div className="flex items-center gap-4">
+            <a
+              href={contractExplorerUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-stone-900"
+            >
+              Soroban Contract: {DEPLOY_CONFIG.contractId.slice(0, 8)}...{DEPLOY_CONFIG.contractId.slice(-6)} ↗
+            </a>
+          </div>
+        </div>
+      </footer>
 
       {/* =========================================================
           "HOW IT WORKS" ONBOARDING MODAL (ACCESSIBLE ANYTIME)
