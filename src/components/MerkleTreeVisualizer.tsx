@@ -51,13 +51,13 @@ export const MerkleTreeVisualizer: React.FC<MerkleTreeVisualizerProps> = ({
         {/* Card 2 */}
         <div className="bg-white border border-stone-300 p-3.5 space-y-1">
           <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-stone-500">
-            2. MASTER FINGERPRINT
+            2. AUTOMATIC MERKLE TREE (1 SEAL)
           </div>
           <div className="text-sm font-bold text-stone-950">
-            1 combined seal for the whole file
+            10 or 10,000 rows = 1 single Stellar TX
           </div>
           <p className="text-xs text-stone-600">
-            If even 1 character changes in any row, this master seal changes.
+            All rows combine into 1 Master Seal (32 bytes), so sealing 10,000 rows costs the exact same 1 transaction (~0.00001 XLM) as 10 rows.
           </p>
           <div className="pt-1.5 font-mono text-[11px] text-stone-500 truncate">
             Seal: {ledger.merkleRoot.slice(0, 18)}...

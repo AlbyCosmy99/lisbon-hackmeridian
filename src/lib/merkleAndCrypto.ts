@@ -244,10 +244,10 @@ export async function processLedgerContent(
     textContent = content;
   } else {
     try {
-      // Slice to first 256 KB for fast tabular row extraction on huge files (e.g. 15 MB CSVs)
+      // Slice up to 4 MB for fast tabular row extraction on huge files (e.g. 15 MB CSVs)
       // while rawFileHash above still hashes 100% of rawBytes!
       const previewSlice =
-        content.byteLength > 262144 ? content.subarray(0, 262144) : content;
+        content.byteLength > 4194304 ? content.subarray(0, 4194304) : content;
       textContent = new TextDecoder('utf-8', { fatal: false }).decode(previewSlice);
     } catch {
       textContent = '';
@@ -265,8 +265,8 @@ export async function processLedgerContent(
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
-  // Cap at header + 100 rows for instant UI and Merkle tree rendering on massive CSV dumps
-  const nonEmptyLines = allNonEmptyLines.slice(0, 101);
+  // Support up to 2,500 rows per file in the interactive browser Merkle tree
+  const nonEmptyLines = allNonEmptyLines.slice(0, 2501);
 
   let delimiter: ',' | ';' | '\t' = ',';
   let isAccountingSchema = false;
@@ -703,7 +703,7 @@ export async function processLedgerContent(
       );
 
       const todayIso = new Date().toISOString().slice(0, 10);
-      for (let i = 1; i < Math.min(nonEmptyLines.length, 61); i += 1) {
+      for (let i = 1; i < nonEmptyLines.length; i += 1) {
         const cells = splitCsvLine(nonEmptyLines[i], delimiter);
         if (cells.length === 0 || cells.every((c) => !c)) continue;
 
@@ -768,7 +768,7 @@ export async function processLedgerContent(
         : [parsedJson];
 
       const todayIso = new Date().toISOString().slice(0, 10);
-      for (let i = 0; i < Math.min(items.length, 60); i += 1) {
+      for (let i = 0; i < Math.min(items.length, 2500); i += 1) {
         const obj = items[i] || {};
         const keys = Object.keys(obj);
         const rowIndex = rows.length + 1;
@@ -1217,7 +1217,7 @@ export async function processMultipleFilesBatch(
 
   const combinedRows: LedgerRow[] = [];
   for (const item of parsedList) {
-    for (const r of item.rows.slice(0, 25)) {
+    for (const r of item.rows.slice(0, 500)) {
       const rowIndex = combinedRows.length + 1;
       const entryId = `${item.fileName.slice(0, 12)}#${r.rowIndex}`;
       const canonicalString = `${rowIndex}|${item.fileName}|${r.canonicalString}`;
