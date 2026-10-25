@@ -59,6 +59,8 @@ export function App() {
   const [issuerExistingRecord, setIssuerExistingRecord] = useState<OnChainAuditRecord | null>(null);
   const [showMerkleTopology, setShowMerkleTopology] = useState<boolean>(false);
   const [showTechnicalReceipt, setShowTechnicalReceipt] = useState<boolean>(false);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(25);
 
   // Locally cached authentic snapshots ONLY AFTER they have been sealed on Stellar!
   const [sealedSnapshots, setSealedSnapshots] = useState<Record<string, ParsedLedger>>({});
@@ -534,6 +536,34 @@ export function App() {
         r.description.toLowerCase().includes(q)
     );
   }, [activeLedger, rowSearchQuery]);
+
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(filteredRows.length / pageSize)),
+    [filteredRows.length, pageSize]
+  );
+
+  // Reset to page 1 when file or search changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeLedger?.fileName, rowSearchQuery, pageSize]);
+
+  // If tampering is detected on a row, automatically jump to the page containing that modified row
+  useEffect(() => {
+    if (activeTab === 'auditor' && tamperXRay && tamperXRay.modifiedRows.length > 0) {
+      const firstModRowIdx = tamperXRay.modifiedRows[0].rowIndex;
+      const posInFiltered = filteredRows.findIndex((r) => r.rowIndex === firstModRowIdx);
+      if (posInFiltered !== -1) {
+        setCurrentPage(Math.floor(posInFiltered / pageSize) + 1);
+      }
+    }
+  }, [activeTab, tamperXRay, filteredRows, pageSize]);
+
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+
+  const paginatedRows = useMemo(() => {
+    const startIdx = (safeCurrentPage - 1) * pageSize;
+    return filteredRows.slice(startIdx, startIdx + pageSize);
+  }, [filteredRows, safeCurrentPage, pageSize]);
 
   const diffByRowIndex = useMemo(() => {
     const map = new Map<number, RowDiffItem>();
@@ -1272,24 +1302,74 @@ export function App() {
               />
             )}
 
-            {/* Table Header & Search Bar */}
-            <div className="px-6 sm:px-8 py-3 border-b border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-4">
-              <span className="text-xs font-semibold uppercase tracking-wider text-stone-600">
-                {activeLedger.documentMode === 'accounting_gl'
-                  ? `Extracted Accounting Rows (${filteredRows.length})`
-                  : `Extracted Document Rows (${filteredRows.length})`}
-              </span>
-              <input
-                type="text"
-                value={rowSearchQuery}
-                onChange={(e) => setRowSearchQuery(e.target.value)}
-                placeholder="Search any row or text..."
-                className="w-full sm:w-72 px-3 py-1.5 text-sm bg-white border border-stone-300 text-stone-900 focus:outline-none focus:border-stone-900"
-              />
+            {/* Table Header, Page Size Selector & Search Bar */}
+            <div className="px-6 sm:px-8 py-3.5 border-b border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-xs font-semibold uppercase tracking-wider text-stone-700">
+                  {activeLedger.documentMode === 'accounting_gl'
+                    ? `Accounting Rows (${filteredRows.length} Total)`
+                    : `Document Rows (${filteredRows.length} Total)`}
+                </span>
+
+                {totalPages > 1 && (
+                  <span className="px-2 py-0.5 bg-white border border-stone-300 font-mono text-xs text-stone-700">
+                    Page {safeCurrentPage} of {totalPages}
+                  </span>
+                )}
+
+                {activeTab === 'auditor' &&
+                  tamperXRay &&
+                  tamperXRay.modifiedRows.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const modIdx = tamperXRay.modifiedRows[0].rowIndex;
+                        const pos = filteredRows.findIndex(
+                          (r) => r.rowIndex === modIdx
+                        );
+                        if (pos !== -1) {
+                          setCurrentPage(Math.floor(pos / pageSize) + 1);
+                        }
+                        void handleSelectProofRow(modIdx);
+                      }}
+                      className="px-2.5 py-0.5 bg-red-700 hover:bg-red-800 text-white font-mono text-xs font-bold cursor-pointer"
+                    >
+                      ✕ Jump to Modified Row #{tamperXRay.modifiedRows[0].rowIndex}
+                    </button>
+                  )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
+                <div className="flex items-center gap-1 font-mono text-xs text-stone-600">
+                  <span>Show:</span>
+                  {[25, 50, 100].map((size) => (
+                    <button
+                      key={size}
+                      type="button"
+                      onClick={() => setPageSize(size)}
+                      className={`px-2 py-1 border cursor-pointer ${
+                        pageSize === size
+                          ? 'bg-stone-950 text-white border-stone-950 font-bold'
+                          : 'bg-white text-stone-700 border-stone-300 hover:bg-stone-100'
+                      }`}
+                    >
+                      {size}
+                    </button>
+                  ))}
+                </div>
+
+                <input
+                  type="text"
+                  value={rowSearchQuery}
+                  onChange={(e) => setRowSearchQuery(e.target.value)}
+                  placeholder="Search any row or text..."
+                  className="w-full sm:w-64 px-3 py-1.5 text-sm bg-white border border-stone-300 text-stone-900 focus:outline-none focus:border-stone-900"
+                />
+              </div>
             </div>
 
             {/* Clean Read-Only Data Table */}
-            <div className="overflow-x-auto overflow-y-auto max-h-[520px] pb-4 bg-white">
+            <div className="overflow-x-auto overflow-y-auto max-h-[540px] pb-4 bg-white">
               <table className="w-full text-left border-collapse">
                 <thead className="sticky top-0 z-10 bg-stone-100 border-b border-[#D8D4CA]">
                   <tr className="text-xs font-semibold uppercase tracking-wider text-stone-700">
@@ -1308,7 +1388,7 @@ export function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-200 text-sm">
-                  {filteredRows.map((row) => {
+                  {paginatedRows.map((row) => {
                     const diff = diffByRowIndex.get(row.rowIndex);
                     const isTampered = Boolean(diff);
                     const isSelected = row.rowIndex === selectedProofRowIndex;
@@ -1432,14 +1512,69 @@ export function App() {
               </table>
             </div>
 
-            {/* Table Bottom Breathing Strip */}
-            <div className="px-6 sm:px-8 py-3.5 border-t border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-stone-500">
-              <span>
-                Showing {filteredRows.length} of {activeLedger.rows.length} protected rows
-              </span>
-              <span>
-                100% Client-Side SHA-256 Row Indexing · Click any row to inspect proof
-              </span>
+            {/* Table Bottom Pagination & Status Bar */}
+            <div className="px-6 sm:px-8 py-4 border-t border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-4 text-xs font-mono text-stone-700">
+              <div>
+                Showing{' '}
+                <strong>
+                  {filteredRows.length === 0
+                    ? 0
+                    : (safeCurrentPage - 1) * pageSize + 1}
+                  {' - '}
+                  {Math.min(safeCurrentPage * pageSize, filteredRows.length)}
+                </strong>{' '}
+                of <strong>{filteredRows.length}</strong> rows ({activeLedger.rows.length} total rows locked in 1 Merkle Seal)
+              </div>
+
+              {totalPages > 1 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage <= 1}
+                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                    className="px-3 py-1.5 border border-stone-400 bg-white hover:bg-stone-100 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    ← Prev
+                  </button>
+
+                  {Array.from({ length: totalPages }, (_, i) => i + 1)
+                    .filter(
+                      (p) =>
+                        p === 1 ||
+                        p === totalPages ||
+                        Math.abs(p - safeCurrentPage) <= 2
+                    )
+                    .map((p, idx, arr) => (
+                      <span key={p} className="flex items-center gap-1.5">
+                        {idx > 0 && arr[idx - 1] !== p - 1 && (
+                          <span className="px-1 text-stone-400">...</span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setCurrentPage(p)}
+                          className={`px-2.5 py-1.5 border font-bold cursor-pointer ${
+                            p === safeCurrentPage
+                              ? 'bg-stone-950 text-white border-stone-950'
+                              : 'bg-white text-stone-800 border-stone-300 hover:bg-stone-100'
+                          }`}
+                        >
+                          {p}
+                        </button>
+                      </span>
+                    ))}
+
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage >= totalPages}
+                    onClick={() =>
+                      setCurrentPage((p) => Math.min(totalPages, p + 1))
+                    }
+                    className="px-3 py-1.5 border border-stone-400 bg-white hover:bg-stone-100 disabled:opacity-40 font-semibold cursor-pointer"
+                  >
+                    Next →
+                  </button>
+                </div>
+              )}
             </div>
           </section>
 
