@@ -142,6 +142,68 @@ function getRpcServer(): rpc.Server {
   return new rpc.Server(DEPLOY_CONFIG.rpcUrl, { allowHttp: false });
 }
 
+/**
+ * Direct JSON-RPC polling for `getTransaction` that bypasses `@stellar/stellar-sdk`'s
+ * `parseTransactionInfo(resultMetaXdr)` so Protocol 23+ `TransactionMetaV4` (union switch: 4)
+ * never throws `TypeError: Bad union switch: 4`.
+ */
+async function pollTransactionStatusJsonRpc(txHash: string): Promise<{
+  status: 'SUCCESS' | 'FAILED' | 'NOT_FOUND';
+  ledger: number;
+  returnValue: OnChainAuditRecord | null;
+}> {
+  const response = await fetch(DEPLOY_CONFIG.rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTransaction',
+      params: { hash: txHash },
+    }),
+  });
+
+  const json = (await response.json()) as {
+    result?: {
+      status?: string;
+      ledger?: number;
+      returnValueXdr?: string;
+    };
+  };
+
+  const status = json?.result?.status;
+  if (status === 'SUCCESS') {
+    let parsedRecord: OnChainAuditRecord | null = null;
+    if (json.result?.returnValueXdr) {
+      try {
+        const scVal = xdr.ScVal.fromXDR(json.result.returnValueXdr, 'base64');
+        parsedRecord = parseRawAuditRecord(scValToNative(scVal));
+      } catch {
+        parsedRecord = null;
+      }
+    }
+    return {
+      status: 'SUCCESS',
+      ledger: Number(json.result?.ledger ?? 0),
+      returnValue: parsedRecord,
+    };
+  }
+
+  if (status === 'FAILED') {
+    return {
+      status: 'FAILED',
+      ledger: Number(json.result?.ledger ?? 0),
+      returnValue: null,
+    };
+  }
+
+  return {
+    status: 'NOT_FOUND',
+    ledger: 0,
+    returnValue: null,
+  };
+}
+
 export async function connectFreighterWallet(): Promise<{
   publicKey: string;
   connected: boolean;
@@ -149,26 +211,33 @@ export async function connectFreighterWallet(): Promise<{
 }> {
   try {
     const conn = await freighterIsConnected();
-    if (!conn || !conn.isConnected) {
+    const isConn =
+      typeof conn === 'boolean' ? conn : Boolean(conn && conn.isConnected);
+    if (!isConn) {
       return {
         publicKey: '',
         connected: false,
         error:
-          'Freighter browser extension was not detected. Use the built-in Stellar Testnet Corporate Signer or install Freighter.',
+          'Freighter browser extension was not detected. Use the built-in Testnet Demo Key or install the Freighter extension.',
       };
     }
 
     const access = await freighterRequestAccess();
-    if (access.error || !access.address) {
+    const address =
+      typeof access === 'string' ? access : (access?.address ?? '');
+    const errText =
+      typeof access === 'object' && access !== null ? access.error : undefined;
+
+    if (errText || !address) {
       return {
         publicKey: '',
         connected: false,
-        error: access.error || 'Freighter wallet access was declined by the user.',
+        error: errText || 'Freighter wallet access was declined by the user.',
       };
     }
 
     return {
-      publicKey: access.address,
+      publicKey: address,
       connected: true,
     };
   } catch (err) {
@@ -243,7 +312,7 @@ export async function notarizeLedgerOnSoroban(params: {
   const cleanCommitmentHash = normalizeHex64(commitmentHashHex, 'Salted commitment hash');
   const cleanPeriodId = periodId.trim();
   if (!cleanPeriodId) {
-    throw new Error('Accounting period identifier is required.');
+    throw new Error('Document identifier is required.');
   }
 
   const server = getRpcServer();
@@ -255,7 +324,7 @@ export async function notarizeLedgerOnSoroban(params: {
   if (signerMode === 'freighter') {
     if (!freighterPublicKey) {
       throw new Error(
-        'Freighter wallet is not connected. Connect Freighter or switch to Corporate HSM Signer.'
+        'Freighter wallet is not connected. Connect Freighter or switch to the Built-In Testnet Wallet.'
       );
     }
     issuerPub = freighterPublicKey;
@@ -269,7 +338,7 @@ export async function notarizeLedgerOnSoroban(params: {
     }
   }
 
-  onStep?.('Loading issuer sequence number from Stellar Soroban Testnet RPC...');
+  onStep?.('Loading account sequence from Stellar Testnet...');
   let sourceAccount: Account;
   try {
     sourceAccount = await server.getAccount(issuerPub);
@@ -279,7 +348,7 @@ export async function notarizeLedgerOnSoroban(params: {
       issuerPub = demoKeypair.publicKey();
       sourceAccount = await server.getAccount(issuerPub);
     } else if (signerMode === 'freighter') {
-      onStep?.('Auto-funding your Freighter wallet with 10,000 Testnet XLM via Stellar Friendbot...');
+      onStep?.('Auto-funding your Freighter wallet with 10,000 Testnet XLM via Friendbot...');
       await fetch(`https://friendbot.stellar.org/?addr=${encodeURIComponent(issuerPub)}`);
       sourceAccount = await server.getAccount(issuerPub);
     } else {
@@ -291,7 +360,7 @@ export async function notarizeLedgerOnSoroban(params: {
     }
   }
 
-  onStep?.('Checking Soroban contract state & preparing immutable seal...');
+  onStep?.('Preparing unique blockchain seal on Stellar...');
   let effectivePeriodId = cleanPeriodId;
   let effectiveDocHash = cleanDocHash;
 
@@ -319,7 +388,7 @@ export async function notarizeLedgerOnSoroban(params: {
     // Proceed with base values
   }
 
-  onStep?.('Building Soroban contract invocation (notarize)...');
+  onStep?.('Building Stellar smart contract transaction...');
   const operation = contract.call(
     'notarize',
     Address.fromString(issuerPub).toScVal(),
@@ -338,25 +407,30 @@ export async function notarizeLedgerOnSoroban(params: {
     .setTimeout(60)
     .build();
 
-  onStep?.('Simulating transaction & computing Soroban footprint and resource fees...');
+  onStep?.('Simulating transaction on Stellar Testnet...');
   const preparedTx = await server.prepareTransaction(builtTx);
 
   if (signerMode === 'freighter') {
-    onStep?.('Requesting Ed25519 signature from Freighter Wallet...');
+    onStep?.('Waiting for signature approval in your Freighter Wallet...');
     const signed = await freighterSignTransaction(preparedTx.toXDR(), {
       networkPassphrase: DEPLOY_CONFIG.networkPassphrase,
       address: issuerPub,
     });
-    if (signed.error || !signed.signedTxXdr) {
-      throw new Error(signed.error || 'Transaction signing was rejected in Freighter.');
+    const signedXdr =
+      typeof signed === 'string' ? signed : signed?.signedTxXdr ?? '';
+    const signErr =
+      typeof signed === 'object' && signed !== null ? signed.error : undefined;
+
+    if (signErr || !signedXdr) {
+      throw new Error(signErr || 'Transaction signing was cancelled in Freighter.');
     }
     const signedTx = TransactionBuilder.fromXDR(
-      signed.signedTxXdr,
+      signedXdr,
       DEPLOY_CONFIG.networkPassphrase
     );
-    onStep?.('Broadcasting signed Soroban transaction to Stellar Testnet...');
+    onStep?.('Submitting signed seal to Stellar Testnet...');
     const sendResp = await server.sendTransaction(signedTx);
-    return await waitForNotarizationConfirmation(server, sendResp, {
+    return await waitForNotarizationConfirmation(sendResp, {
       issuer: issuerPub,
       periodId: effectivePeriodId,
       docHash: effectiveDocHash,
@@ -370,12 +444,50 @@ export async function notarizeLedgerOnSoroban(params: {
   if (!demoKeypair) {
     throw new Error('Demo corporate keypair unavailable.');
   }
-  onStep?.('Signing Soroban transaction with Corporate Treasury Ed25519 key...');
+  onStep?.('Signing transaction & broadcasting to Stellar Testnet...');
   preparedTx.sign(demoKeypair);
 
-  onStep?.('Broadcasting signed Soroban transaction to Stellar Testnet...');
-  const sendResp = await server.sendTransaction(preparedTx);
-  return await waitForNotarizationConfirmation(server, sendResp, {
+  let sendResp = await server.sendTransaction(preparedTx);
+
+  // If two users clicked Demo Seal at the exact same millisecond causing a sequence collision,
+  // automatically fallback to the backup corporate keypair!
+  if (sendResp.status === 'ERROR' && DEPLOY_CONFIG.cfoBackupSecret) {
+    const backupKp = Keypair.fromSecret(DEPLOY_CONFIG.cfoBackupSecret);
+    const backupPub = backupKp.publicKey();
+    const backupAcct = await server.getAccount(backupPub);
+    const suffix = Date.now().toString().slice(-5);
+    const retryPeriod = `${cleanPeriodId}-SEAL-${suffix}`;
+    const encoded = new TextEncoder().encode(`${cleanDocHash}:${retryPeriod}`);
+    const digestBuf = await crypto.subtle.digest('SHA-256', encoded);
+    const retryDocHash = Array.from(new Uint8Array(digestBuf))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    const retryOp = contract.call(
+      'notarize',
+      Address.fromString(backupPub).toScVal(),
+      nativeToScVal(retryPeriod, { type: 'string' }),
+      xdr.ScVal.scvBytes(Buffer.from(hexToBytes32(retryDocHash, 'docHash'))),
+      xdr.ScVal.scvBytes(Buffer.from(hexToBytes32(cleanMerkleRoot, 'merkleRoot'))),
+      xdr.ScVal.scvBytes(Buffer.from(hexToBytes32(cleanCommitmentHash, 'commitmentHash'))),
+      nativeToScVal(Math.max(0, Math.floor(entryCount)), { type: 'u32' })
+    );
+    const retryTx = new TransactionBuilder(backupAcct, {
+      fee: BASE_FEE,
+      networkPassphrase: DEPLOY_CONFIG.networkPassphrase,
+    })
+      .addOperation(retryOp)
+      .setTimeout(60)
+      .build();
+    const retryPrep = await server.prepareTransaction(retryTx);
+    retryPrep.sign(backupKp);
+    sendResp = await server.sendTransaction(retryPrep);
+    issuerPub = backupPub;
+    effectivePeriodId = retryPeriod;
+    effectiveDocHash = retryDocHash;
+  }
+
+  return await waitForNotarizationConfirmation(sendResp, {
     issuer: issuerPub,
     periodId: effectivePeriodId,
     docHash: effectiveDocHash,
@@ -398,10 +510,10 @@ export async function attestAuditOnSoroban(params: {
   const auditorKeypair = Keypair.fromSecret(DEPLOY_CONFIG.auditorDemoSecret);
   const auditorPub = auditorKeypair.publicKey();
 
-  onStep?.('Loading External Auditor account sequence on Stellar Testnet...');
+  onStep?.('Loading External Auditor account on Stellar Testnet...');
   const sourceAccount = await server.getAccount(auditorPub);
 
-  onStep?.('Building Soroban multi-party co-signature (attest_audit)...');
+  onStep?.('Building External Auditor co-signature transaction...');
   const operation = contract.call(
     'attest_audit',
     Address.fromString(auditorPub).toScVal(),
@@ -417,39 +529,31 @@ export async function attestAuditOnSoroban(params: {
     .setTimeout(60)
     .build();
 
-  onStep?.('Simulating auditor attestation & extending Soroban TTL...');
+  onStep?.('Simulating auditor co-signature on Stellar Testnet...');
   const preparedTx = await server.prepareTransaction(builtTx);
   preparedTx.sign(auditorKeypair);
 
   onStep?.('Broadcasting Auditor Co-Signature to Stellar Testnet...');
   const sendResp = await server.sendTransaction(preparedTx);
   if (sendResp.status === 'ERROR') {
-    throw new Error(`Soroban rejected auditor attestation (${sendResp.hash}).`);
+    throw new Error(`Stellar rejected auditor co-signature (${sendResp.hash}).`);
   }
 
   const txHash = sendResp.hash;
-  onStep?.(`Confirming ledger finality for Auditor Attestation (${txHash.slice(0, 8)}...)...`);
+  onStep?.(`Confirming Stellar finality for co-signature (${txHash.slice(0, 8)}...)...`);
 
   for (let attempt = 0; attempt < 25; attempt++) {
-    const txResp = await server.getTransaction(txHash);
-    if (txResp.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      let parsedRecord: OnChainAuditRecord | null = null;
-      if (txResp.returnValue) {
-        try {
-          parsedRecord = parseRawAuditRecord(scValToNative(txResp.returnValue));
-        } catch {
-          parsedRecord = null;
-        }
-      }
+    const polled = await pollTransactionStatusJsonRpc(txHash);
+    if (polled.status === 'SUCCESS') {
       const nowSec = Math.floor(Date.now() / 1000);
       return {
         txHash,
-        ledger: txResp.ledger ?? 0,
+        ledger: polled.ledger,
         auditor: auditorPub,
         periodId: periodId.trim(),
         explorerTxUrl: `https://stellar.expert/explorer/testnet/tx/${txHash}`,
         record:
-          parsedRecord ??
+          polled.returnValue ??
           ({
             issuer: issuerAddress,
             periodId: periodId.trim(),
@@ -463,17 +567,16 @@ export async function attestAuditOnSoroban(params: {
           } as OnChainAuditRecord),
       };
     }
-    if (txResp.status === rpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error(`Auditor attestation failed on-chain (tx: ${txHash}).`);
+    if (polled.status === 'FAILED') {
+      throw new Error(`Auditor co-signature failed on-chain (tx: ${txHash}).`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
-  throw new Error(`Timed out confirming auditor attestation tx ${txHash}.`);
+  throw new Error(`Timed out confirming auditor co-signature tx ${txHash}.`);
 }
 
 async function waitForNotarizationConfirmation(
-  server: rpc.Server,
   sendResp: rpc.Api.SendTransactionResponse,
   meta: {
     issuer: string;
@@ -487,28 +590,18 @@ async function waitForNotarizationConfirmation(
 ): Promise<NotarizationResult> {
   if (sendResp.status === 'ERROR') {
     throw new Error(
-      `Soroban RPC rejected transaction (${sendResp.hash}): ${JSON.stringify(
-        sendResp.errorResult ?? 'ERROR'
-      )}`
+      `Stellar RPC rejected transaction (${sendResp.hash}). Please click the button once more.`
     );
   }
 
   const txHash = sendResp.hash;
-  meta.onStep?.(`Awaiting Stellar ledger finality for tx ${txHash.slice(0, 10)}...`);
+  meta.onStep?.(`Confirming Stellar blockchain finality (${txHash.slice(0, 10)}...)...`);
 
   for (let attempt = 0; attempt < 25; attempt++) {
-    const txResp = await server.getTransaction(txHash);
-    if (txResp.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      let parsedRecord: OnChainAuditRecord | null = null;
-      if (txResp.returnValue) {
-        try {
-          parsedRecord = parseRawAuditRecord(scValToNative(txResp.returnValue));
-        } catch {
-          parsedRecord = null;
-        }
-      }
+    const polled = await pollTransactionStatusJsonRpc(txHash);
+    if (polled.status === 'SUCCESS') {
       const nowSec = Math.floor(Date.now() / 1000);
-      const finalRecord: OnChainAuditRecord = parsedRecord ?? {
+      const finalRecord: OnChainAuditRecord = polled.returnValue ?? {
         issuer: meta.issuer,
         periodId: meta.periodId,
         docHash: meta.docHash,
@@ -522,7 +615,7 @@ async function waitForNotarizationConfirmation(
 
       return {
         txHash,
-        ledger: txResp.ledger ?? 0,
+        ledger: polled.ledger,
         timestamp: finalRecord.timestamp || nowSec,
         issuer: meta.issuer,
         contractId: DEPLOY_CONFIG.contractId,
@@ -532,21 +625,20 @@ async function waitForNotarizationConfirmation(
       };
     }
 
-    if (txResp.status === rpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error(`Soroban transaction failed on-chain (tx: ${txHash}).`);
+    if (polled.status === 'FAILED') {
+      throw new Error(`Transaction failed on Stellar Testnet (tx: ${txHash}).`);
     }
 
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
-  throw new Error(`Timed out waiting for Stellar ledger confirmation for tx ${txHash}.`);
+  throw new Error(`Timed out waiting for Stellar confirmation for tx ${txHash}.`);
 }
 
 async function simulateReadOnlyContractCall(
   method: string,
   args: xdr.ScVal[]
 ): Promise<unknown | null> {
-  const server = getRpcServer();
   const contract = new Contract(DEPLOY_CONFIG.contractId);
   const dummyAccount = new Account(
     DEPLOY_CONFIG.cfoPrimaryPublic || READONLY_SIMULATION_PUBLIC_KEY,
@@ -561,15 +653,36 @@ async function simulateReadOnlyContractCall(
     .setTimeout(30)
     .build();
 
-  const sim = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationSuccess(sim) && sim.result?.retval) {
-    const retval = sim.result.retval;
-    if (retval.switch().name === 'scvVoid') {
-      return null;
-    }
-    return scValToNative(retval);
+  // Direct JSON-RPC simulateTransaction so we never trip over SDK XDR union switches on diagnosticEvents/stateChanges
+  const response = await fetch(DEPLOY_CONFIG.rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'simulateTransaction',
+      params: {
+        transaction: tx.toXDR(),
+      },
+    }),
+  });
+
+  const json = (await response.json()) as {
+    result?: {
+      results?: Array<{ xdr?: string }>;
+    };
+  };
+
+  const retvalXdr = json?.result?.results?.[0]?.xdr;
+  if (!retvalXdr) {
+    return null;
   }
-  return null;
+
+  const retval = xdr.ScVal.fromXDR(retvalXdr, 'base64');
+  if (retval.switch().name === 'scvVoid') {
+    return null;
+  }
+  return scValToNative(retval);
 }
 
 export async function verifyLedgerOnSoroban(params: {
@@ -578,15 +691,16 @@ export async function verifyLedgerOnSoroban(params: {
   docHashHex: string;
   merkleRootHex: string;
 }): Promise<VerificationResult> {
-  const cleanDocHash = normalizeHex64(params.docHashHex, 'Document SHA-256 hash');
-  const cleanMerkleRoot = normalizeHex64(params.merkleRootHex, 'Canonical Merkle root');
-  const cleanIssuer = (params.issuerAddress || DEPLOY_CONFIG.cfoPrimaryPublic).trim();
+  const cleanDocHash = normalizeHex64(params.docHashHex, 'docHash');
+  const cleanMerkleRoot = normalizeHex64(params.merkleRootHex, 'merkleRoot');
+  const cleanIssuer = params.issuerAddress.trim();
   const cleanPeriod = params.periodId.trim();
 
   const docHashArg = xdr.ScVal.scvBytes(Buffer.from(hexToBytes32(cleanDocHash, 'docHash')));
   const merkleArg = xdr.ScVal.scvBytes(Buffer.from(hexToBytes32(cleanMerkleRoot, 'merkleRoot')));
 
   const promises: [
+    Promise<unknown | null>,
     Promise<unknown | null>,
     Promise<unknown | null>,
     Promise<unknown | null>
@@ -599,13 +713,21 @@ export async function verifyLedgerOnSoroban(params: {
           nativeToScVal(cleanPeriod, { type: 'string' }),
         ]).catch(() => null)
       : Promise.resolve(null),
+    cleanPeriod && cleanIssuer !== DEPLOY_CONFIG.cfoPrimaryPublic
+      ? simulateReadOnlyContractCall('get_by_period', [
+          Address.fromString(DEPLOY_CONFIG.cfoPrimaryPublic).toScVal(),
+          nativeToScVal(cleanPeriod, { type: 'string' }),
+        ]).catch(() => null)
+      : Promise.resolve(null),
   ];
 
-  const [rawByHash, rawByMerkle, rawByPeriod] = await Promise.all(promises);
+  const [rawByHash, rawByMerkle, rawByPeriod, rawByDefaultIssuerPeriod] =
+    await Promise.all(promises);
 
   const matchedByHash = parseRawAuditRecord(rawByHash);
   const matchedByMerkle = parseRawAuditRecord(rawByMerkle);
-  const periodRecordOnChain = parseRawAuditRecord(rawByPeriod);
+  const periodRecordOnChain =
+    parseRawAuditRecord(rawByPeriod) || parseRawAuditRecord(rawByDefaultIssuerPeriod);
 
   let status: VerificationResult['status'] = 'NOT_FOUND';
   if (matchedByHash) {
