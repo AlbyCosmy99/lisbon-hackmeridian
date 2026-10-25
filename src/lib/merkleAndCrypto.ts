@@ -188,15 +188,13 @@ export async function buildMerkleLayers(leafHashes: string[]): Promise<string[][
     if (workingLayer.length % 2 === 1) {
       workingLayer.push(workingLayer[workingLayer.length - 1]);
     }
-    const nextLayer: string[] = [];
+    const pairPromises: Promise<string>[] = [];
     for (let i = 0; i < workingLayer.length; i += 2) {
       const left = workingLayer[i];
       const right = workingLayer[i + 1];
-      const parentHash = await sha256Hex(
-        `AUDITLEDGER_NODE_V1:${left}:${right}`
-      );
-      nextLayer.push(parentHash);
+      pairPromises.push(sha256Hex(`AUDITLEDGER_NODE_V1:${left}:${right}`));
     }
+    const nextLayer = await Promise.all(pairPromises);
     layers.push(nextLayer);
     currentLayer = nextLayer;
   }
@@ -244,11 +242,8 @@ export async function processLedgerContent(
     textContent = content;
   } else {
     try {
-      // Slice up to 4 MB for fast tabular row extraction on huge files (e.g. 15 MB CSVs)
-      // while rawFileHash above still hashes 100% of rawBytes!
-      const previewSlice =
-        content.byteLength > 4194304 ? content.subarray(0, 4194304) : content;
-      textContent = new TextDecoder('utf-8', { fatal: false }).decode(previewSlice);
+      // Decode full file content while rawFileHash above hashes 100% of rawBytes
+      textContent = new TextDecoder('utf-8', { fatal: false }).decode(content);
     } catch {
       textContent = '';
     }
@@ -265,8 +260,7 @@ export async function processLedgerContent(
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
-  // Support up to 2,500 rows per file in the interactive browser Merkle tree
-  const nonEmptyLines = allNonEmptyLines.slice(0, 2501);
+  const nonEmptyLines = allNonEmptyLines;
 
   let delimiter: ',' | ';' | '\t' = ',';
   let isAccountingSchema = false;
