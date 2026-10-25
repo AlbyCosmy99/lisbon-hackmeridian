@@ -208,11 +208,15 @@ function inferPeriodId(fileName: string, override?: string): string {
   if (override && override.trim().length > 0) {
     return override.trim();
   }
-  const match = fileName.match(/(20\d{2}[-_]\d{2})/);
+  const cleanName = fileName.replace(
+    /^(MODIFIED|ALTERED|TAMPERED|EDITED|COPY_OF)[-_ ]+/i,
+    ''
+  );
+  const match = cleanName.match(/(20\d{2}[-_]\d{2})/);
   if (match) {
     return `${match[1].replace('_', '-')}-SAP-GL`;
   }
-  const baseName = fileName
+  const baseName = cleanName
     .replace(/\.[^/.]+$/, '')
     .toUpperCase()
     .replace(/[^A-Z0-9]+/g, '-')
@@ -1002,7 +1006,7 @@ export async function createTamperedCloneOfLedger(
   return {
     tamperedLedger: {
       ...ledger,
-      fileName: `ALTERED_${ledger.fileName}`,
+      fileName: `MODIFIED_${ledger.fileName}`,
       rawFileHash,
       merkleRoot,
       rows: clonedRows,
@@ -1011,5 +1015,44 @@ export async function createTamperedCloneOfLedger(
       merkleLayers,
     },
     note,
+  };
+}
+
+export function exportTamperedCsvDownload(
+  ledger: ParsedLedger
+): { fileName: string; csvContent: string } {
+  const targetIdx = Math.min(3, ledger.rows.length - 1);
+  if (ledger.documentMode === 'accounting_gl') {
+    const header =
+      'entry_id,date,account_code,account_name,description,debit_eur,credit_eur,cost_center';
+    const lines = ledger.rows.map((r, idx) => {
+      const debit =
+        idx === targetIdx && (r.debitCents > 0 || r.creditCents === 0)
+          ? ((r.debitCents + 1500000) / 100).toFixed(2)
+          : (r.debitCents / 100).toFixed(2);
+      const credit = (r.creditCents / 100).toFixed(2);
+      return `${r.entryId},${r.date},${r.accountCode},"${r.accountName.replace(
+        /"/g,
+        '""'
+      )}","${r.description.replace(/"/g, '""')}",${debit},${credit},${r.costCenter}`;
+    });
+    return {
+      fileName: `MODIFIED_${ledger.fileName.replace(/\.[^/.]+$/, '')}.csv`,
+      csvContent: [header, ...lines].join('\n'),
+    };
+  }
+
+  const header = `row_id,${ledger.rows[0]?.accountCode || 'record_key'},description`;
+  const lines = ledger.rows.map((r, idx) => {
+    const desc =
+      idx === targetIdx ? `${r.description} [UNAUTHORIZED_EDIT]` : r.description;
+    return `"${r.entryId.replace(/"/g, '""')}","${r.accountName.replace(
+      /"/g,
+      '""'
+    )}","${desc.replace(/"/g, '""')}"`;
+  });
+  return {
+    fileName: `MODIFIED_${ledger.fileName.replace(/\.[^/.]+$/, '')}.csv`,
+    csvContent: [header, ...lines].join('\n'),
   };
 }

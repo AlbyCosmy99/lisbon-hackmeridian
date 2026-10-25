@@ -278,6 +278,10 @@ export async function notarizeLedgerOnSoroban(params: {
       demoKeypair = Keypair.fromSecret(DEPLOY_CONFIG.cfoBackupSecret);
       issuerPub = demoKeypair.publicKey();
       sourceAccount = await server.getAccount(issuerPub);
+    } else if (signerMode === 'freighter') {
+      onStep?.('Auto-funding your Freighter wallet with 10,000 Testnet XLM via Stellar Friendbot...');
+      await fetch(`https://friendbot.stellar.org/?addr=${encodeURIComponent(issuerPub)}`);
+      sourceAccount = await server.getAccount(issuerPub);
     } else {
       throw new Error(
         `Stellar account ${issuerPub.slice(0, 8)}... is not funded on Testnet: ${
@@ -641,5 +645,20 @@ export async function fetchIssuerHistoryOnSoroban(
     return parsed.sort((a, b) => b.timestamp - a.timestamp);
   } catch {
     return [];
+  }
+}
+
+export async function fundAccountOnFriendbot(
+  publicKey: string
+): Promise<boolean> {
+  const clean = publicKey.trim();
+  if (!clean) return false;
+  try {
+    const res = await fetch(
+      `https://friendbot.stellar.org/?addr=${encodeURIComponent(clean)}`
+    );
+    return res.ok;
+  } catch {
+    return false;
   }
 }

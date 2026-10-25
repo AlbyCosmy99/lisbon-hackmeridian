@@ -7,7 +7,7 @@ import {
   RowMerkleProof,
   TamperXRayReport,
   createTamperedCloneOfLedger,
-  editSpecificRowInLedger,
+  exportTamperedCsvDownload,
   formatCentsToEur,
   generateRowMerkleProof,
   processLedgerContent,
@@ -26,6 +26,7 @@ import {
   connectFreighterWallet,
   fetchAccountBalanceXlm,
   fetchIssuerHistoryOnSoroban,
+  fundAccountOnFriendbot,
   getActiveSignerAddress,
   notarizeLedgerOnSoroban,
   verifyLedgerOnSoroban,
@@ -44,6 +45,7 @@ export function App() {
   const [freighterAddress, setFreighterAddress] = useState<string>('');
   const [walletError, setWalletError] = useState<string>('');
   const [xlmBalance, setXlmBalance] = useState<string>('...');
+  const [isFundingWallet, setIsFundingWallet] = useState<boolean>(false);
   const [showWalletMenu, setShowWalletMenu] = useState<boolean>(false);
 
   // Company / Issuer State
@@ -58,7 +60,7 @@ export function App() {
   const [showMerkleTopology, setShowMerkleTopology] = useState<boolean>(false);
   const [showTechnicalReceipt, setShowTechnicalReceipt] = useState<boolean>(false);
 
-  // Locally cached authentic snapshots by periodId for Row-by-Row Redline Diff
+  // Locally cached authentic snapshots ONLY AFTER they have been sealed on Stellar!
   const [sealedSnapshots, setSealedSnapshots] = useState<Record<string, ParsedLedger>>({});
 
   // Auditor State
@@ -71,10 +73,6 @@ export function App() {
   const [attestStep, setAttestStep] = useState<string>('');
   const [attestError, setAttestError] = useState<string>('');
   const [lastAttestation, setLastAttestation] = useState<AttestationResult | null>(null);
-
-  // Interactive Inline Row Tamper Editor (in Auditor Mode)
-  const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null);
-  const [editingRowValue, setEditingRowValue] = useState<string>('');
 
   // Single-Row Merkle Proof State
   const [selectedProofRowIndex, setSelectedProofRowIndex] = useState<number>(1);
@@ -108,9 +106,7 @@ export function App() {
         fetchIssuerHistoryOnSoroban(activeSignerPub),
       ]);
       if (cancelled) return;
-      if (bal !== '0.00') {
-        setXlmBalance(bal);
-      }
+      setXlmBalance(bal);
     }
     void syncChainState();
     return () => {
@@ -124,15 +120,23 @@ export function App() {
     async function checkExistingOnChain() {
       if (!issuerLedger) return;
       try {
+        const effectivePeriod = customPeriodId || issuerLedger.periodId;
         const res = await verifyLedgerOnSoroban({
           issuerAddress: activeSignerPub,
-          periodId: customPeriodId || issuerLedger.periodId,
+          periodId: effectivePeriod,
           docHashHex: issuerLedger.rawFileHash,
           merkleRootHex: issuerLedger.merkleRoot,
         });
         if (cancelled) return;
         const found = res.matchedByHash || res.matchedByMerkle || null;
         setIssuerExistingRecord(found);
+        if (found) {
+          setSealedSnapshots((prev) => ({
+            ...prev,
+            [effectivePeriod]: issuerLedger,
+            [issuerLedger.periodId]: issuerLedger,
+          }));
+        }
       } catch {
         if (!cancelled) setIssuerExistingRecord(null);
       }
@@ -162,6 +166,22 @@ export function App() {
     setShowWalletMenu(false);
   };
 
+  const handleFundCurrentWallet = async () => {
+    setIsFundingWallet(true);
+    setWalletError('');
+    try {
+      const ok = await fundAccountOnFriendbot(activeSignerPub);
+      if (ok) {
+        const bal = await fetchAccountBalanceXlm(activeSignerPub);
+        setXlmBalance(bal);
+      } else {
+        setWalletError('Friendbot funding request did not complete (account may already be funded).');
+      }
+    } finally {
+      setIsFundingWallet(false);
+    }
+  };
+
   const processUploadedFileList = async (
     fileList: FileList,
     targetMode: PortalTab
@@ -172,6 +192,10 @@ export function App() {
       setNotarizeError('');
       setLastNotarization(null);
       setIssuerExistingRecord(null);
+      setVerificationResult(null);
+      setAuditorLedger(null);
+      setTamperXRay(null);
+      setLastAttestation(null);
 
       const loadedFiles: Array<{ name: string; bytes: Uint8Array }> = [];
       for (let i = 0; i < fileList.length; i += 1) {
@@ -183,7 +207,8 @@ export function App() {
       const parsed = await processMultipleFilesBatch(loadedFiles);
       setIssuerLedger(parsed);
       setCustomPeriodId(parsed.periodId);
-      setSealedSnapshots((prev) => ({ ...prev, [parsed.periodId]: parsed }));
+      // IMPORTANT: Do NOT add to sealedSnapshots here!
+      // A file is only added to sealedSnapshots AFTER Step 2 (Lock & Seal on Stellar) completes!
       setSelectedProofRowIndex(1);
       const proof = generateRowMerkleProof(parsed, 1);
       setActiveRowProof(proof);
@@ -235,17 +260,14 @@ export function App() {
     setActiveTab('auditor');
     setAttestError('');
     setLastAttestation(null);
-    setEditingRowIndex(null);
     const effectivePeriod = (customPeriodId || baseLedger.periodId).trim();
     const cleanSnapshot: ParsedLedger = {
       ...baseLedger,
       periodId: effectivePeriod,
     };
-    setSealedSnapshots((prev) => ({ ...prev, [effectivePeriod]: cleanSnapshot }));
 
     if (simulateFraud) {
       const { tamperedLedger, note } = await createTamperedCloneOfLedger(cleanSnapshot);
-      setShowMerkleTopology(true);
       await runAuditorVerification(tamperedLedger, 'tampered_fraud', note);
     } else {
       await runAuditorVerification(
@@ -256,28 +278,20 @@ export function App() {
     }
   };
 
-  const handleApplyInlineRowEdit = async (rowIndex: number) => {
+  const handleDownloadModifiedCsvCopy = () => {
     const baseLedger =
       issuerLedger ||
       (auditorLedger
         ? sealedSnapshots[auditorLedger.periodId] || auditorLedger
         : null);
     if (!baseLedger) return;
-    const effectivePeriod = (customPeriodId || baseLedger.periodId).trim();
-    const cleanSnapshot: ParsedLedger = {
-      ...baseLedger,
-      periodId: effectivePeriod,
-    };
-    setSealedSnapshots((prev) => ({ ...prev, [effectivePeriod]: cleanSnapshot }));
-
-    const { tamperedLedger, note } = await editSpecificRowInLedger(
-      cleanSnapshot,
-      rowIndex,
-      editingRowValue
-    );
-    setEditingRowIndex(null);
-    setShowMerkleTopology(true);
-    await runAuditorVerification(tamperedLedger, 'tampered_fraud', note);
+    const { fileName, csvContent } = exportTamperedCsvDownload(baseLedger);
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.click();
   };
 
   const handleAttestAuditOnSoroban = async () => {
@@ -330,7 +344,12 @@ export function App() {
 
       setLastNotarization(result);
       setIssuerExistingRecord(result.record);
-      setSealedSnapshots((prev) => ({ ...prev, [effectivePeriod]: issuerLedger }));
+      setSealedSnapshots((prev) => ({
+        ...prev,
+        [effectivePeriod]: issuerLedger,
+        [issuerLedger.periodId]: issuerLedger,
+        [result.record.periodId]: issuerLedger,
+      }));
     } catch (err) {
       setNotarizeError(
         err instanceof Error ? err.message : 'Blockchain sealing failed.'
@@ -356,7 +375,10 @@ export function App() {
     setActiveRowProof(proof);
 
     const lookupPeriodId =
-      customPeriodId || issuerLedger?.periodId || ledgerToVerify.periodId;
+      lastNotarization?.record.periodId ||
+      issuerExistingRecord?.periodId ||
+      customPeriodId ||
+      ledgerToVerify.periodId;
 
     const onChainRes = await verifyLedgerOnSoroban({
       issuerAddress: activeSignerPub,
@@ -365,13 +387,30 @@ export function App() {
       merkleRootHex: ledgerToVerify.merkleRoot,
     });
 
+    // Only use a baseline snapshot if this document was ACTUALLY sealed in Step 2!
     const baselineSnapshot =
       sealedSnapshots[ledgerToVerify.periodId] ||
       sealedSnapshots[lookupPeriodId] ||
-      issuerLedger ||
       null;
 
     let effectiveRes = onChainRes;
+
+    // If the file has NOT been sealed on Stellar yet (and is not in sealedSnapshots),
+    // keep status === 'NOT_FOUND' so we never falsely claim an unsealed file is verified!
+    if (onChainRes.status === 'NOT_FOUND' && !baselineSnapshot) {
+      setVerificationResult({
+        status: 'NOT_FOUND',
+        matchedByHash: null,
+        matchedByMerkle: null,
+        periodRecordOnChain: null,
+        checkedAt: Date.now(),
+      });
+      setTamperXRay(null);
+      setAuditorScenarioNote(
+        `This file ("${ledgerToVerify.fileName}") has not been sealed on the Stellar blockchain yet. Go to Step 2 (Company View) and click "Lock & Seal on Stellar" first.`
+      );
+      return;
+    }
 
     if (onChainRes.status === 'NOT_FOUND' && baselineSnapshot) {
       const syntheticRecord: OnChainAuditRecord = {
@@ -423,12 +462,14 @@ export function App() {
     const proofCheck = await verifyRowMerkleProof(proof, expectedRoot);
     setRowProofCheck(proofCheck);
 
+    const compareBase = baselineSnapshot || issuerLedger;
+
     if (
       (effectiveRes.status === 'TAMPERED_PERIOD_MISMATCH' ||
         scenario === 'tampered_fraud') &&
-      baselineSnapshot
+      compareBase
     ) {
-      const xRay = runTamperXRay(baselineSnapshot, ledgerToVerify);
+      const xRay = runTamperXRay(compareBase, ledgerToVerify);
       const firstModified = xRay.modifiedRows[0]?.rowIndex || 1;
       setSelectedProofRowIndex(firstModified);
       const modProof = generateRowMerkleProof(ledgerToVerify, firstModified);
@@ -442,18 +483,23 @@ export function App() {
         periodRecordOnChain:
           effectiveRes.periodRecordOnChain || {
             issuer: activeSignerPub,
-            periodId: baselineSnapshot.periodId,
-            docHash: baselineSnapshot.rawFileHash,
-            merkleRoot: baselineSnapshot.merkleRoot,
-            commitmentHash: baselineSnapshot.commitmentHash,
+            periodId: compareBase.periodId,
+            docHash: compareBase.rawFileHash,
+            merkleRoot: compareBase.merkleRoot,
+            commitmentHash: compareBase.commitmentHash,
             timestamp: Math.floor(Date.now() / 1000),
-            entryCount: baselineSnapshot.rows.length,
+            entryCount: compareBase.rows.length,
             auditor: null,
             auditedAt: 0,
           },
       };
       setVerificationResult(effectiveRes);
       setTamperXRay(xRay);
+      if (scenario === 'custom' && xRay.modifiedRows.length > 0) {
+        setAuditorScenarioNote(
+          `Tampering detected in uploaded file "${ledgerToVerify.fileName}": ${xRay.modifiedRows.length} row(s) differ from the original Stellar blockchain seal.`
+        );
+      }
     } else {
       setTamperXRay(null);
     }
@@ -526,7 +572,7 @@ export function App() {
             <span className="font-serif-editorial text-3xl tracking-tight text-stone-950">
               AuditLedger
             </span>
-            <span className="text-xs font-mono uppercase tracking-widest text-stone-500 hidden md:inline">
+            <span className="text-xs font-mono uppercase tracking-widest text-stone-500 hidden xl:inline">
               / Tamper-Proof Document Seal on Stellar
             </span>
           </div>
@@ -574,15 +620,25 @@ export function App() {
             </button>
           </nav>
 
-          {/* Right: "How It Works" Button + Live Stellar Wallet */}
-          <div className="relative flex items-center gap-2.5">
+          {/* Right: "How It Works" + Prominent Freighter Wallet Connection */}
+          <div className="relative flex items-center gap-2">
             <button
               type="button"
               onClick={() => setShowHowItWorksModal(true)}
-              className="px-3 py-2 border border-stone-900 bg-stone-950 hover:bg-stone-800 text-white text-xs font-mono font-semibold uppercase tracking-wider cursor-pointer"
+              className="px-2.5 py-2 border border-stone-400 bg-white hover:bg-stone-100 text-stone-900 text-xs font-mono font-semibold uppercase tracking-wider cursor-pointer hidden sm:inline-block"
             >
-              ? Why 2 Roles / How It Works
+              ? How It Works
             </button>
+
+            {signerMode !== 'freighter' && (
+              <button
+                type="button"
+                onClick={() => void handleConnectFreighter()}
+                className="px-3 py-2 bg-stone-950 hover:bg-stone-800 text-white text-xs font-mono font-semibold uppercase tracking-wider cursor-pointer"
+              >
+                Connect Freighter Wallet
+              </button>
+            )}
 
             <button
               type="button"
@@ -590,24 +646,44 @@ export function App() {
               className="flex items-center gap-2 px-3 py-2 border border-[#D8D4CA] bg-[#FAF8F5] hover:bg-stone-100 text-xs font-mono text-stone-800 cursor-pointer"
             >
               <span className="w-2 h-2 rounded-full bg-emerald-600" />
-              <span className="hidden sm:inline">
-                {activeSignerPub.slice(0, 5)}..{activeSignerPub.slice(-4)}
+              <span>
+                {signerMode === 'freighter' ? 'Freighter: ' : 'Demo Key: '}
+                {activeSignerPub.slice(0, 4)}..{activeSignerPub.slice(-4)}
               </span>
-              <span className="text-stone-600 font-semibold">
-                {xlmBalance} XLM
+              <span className="text-stone-600 font-semibold hidden md:inline">
+                ({xlmBalance} XLM)
               </span>
             </button>
 
             {showWalletMenu && (
-              <div className="absolute right-0 top-13 w-84 bg-white border border-stone-900 shadow-xl p-4 space-y-3 z-40 text-sm">
+              <div className="absolute right-0 top-13 w-92 bg-white border-2 border-stone-950 shadow-xl p-4 space-y-3 z-40 text-sm">
                 <div className="flex items-center justify-between border-b border-stone-200 pb-2">
                   <span className="font-semibold text-stone-900">
-                    Active Stellar Account
+                    Stellar Signing Wallet
                   </span>
-                  <span className="font-mono text-xs text-emerald-700 font-semibold">
-                    {xlmBalance} XLM
+                  <span className="font-mono text-xs text-emerald-800 font-bold">
+                    Balance: {xlmBalance} XLM
                   </span>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={() => void handleConnectFreighter()}
+                  className={`w-full p-3 text-left border transition cursor-pointer ${
+                    signerMode === 'freighter'
+                      ? 'bg-stone-950 text-white border-stone-950'
+                      : 'bg-[#FAF8F5] hover:bg-stone-100 text-stone-900 border-stone-300'
+                  }`}
+                >
+                  <div className="font-semibold text-sm">
+                    1. Connect Your Own Wallet (Freighter)
+                  </div>
+                  <div className="text-xs opacity-80 mt-0.5">
+                    {freighterAddress
+                      ? `Connected: ${freighterAddress.slice(0, 8)}...${freighterAddress.slice(-6)}`
+                      : 'Sign with your personal Stellar Freighter extension'}
+                  </div>
+                </button>
 
                 <button
                   type="button"
@@ -622,31 +698,29 @@ export function App() {
                       : 'bg-[#FAF8F5] hover:bg-stone-100 text-stone-900 border-stone-300'
                   }`}
                 >
-                  <div className="font-semibold text-sm">Company Stellar Key</div>
+                  <div className="font-semibold text-sm">
+                    2. Built-In Testnet Wallet (Instant 1-Click)
+                  </div>
                   <div className="text-xs opacity-80 mt-0.5">
-                    Live Testnet wallet ready for 1-click sealing
+                    Pre-funded Testnet wallet for quick testing without extensions
                   </div>
                 </button>
 
-                <button
-                  type="button"
-                  onClick={() => void handleConnectFreighter()}
-                  className={`w-full p-3 text-left border transition cursor-pointer ${
-                    signerMode === 'freighter'
-                      ? 'bg-stone-950 text-white border-stone-950'
-                      : 'bg-[#FAF8F5] hover:bg-stone-100 text-stone-900 border-stone-300'
-                  }`}
-                >
-                  <div className="font-semibold text-sm">Freighter Browser Wallet</div>
-                  <div className="text-xs opacity-80 mt-0.5">
-                    {freighterAddress
-                      ? `${freighterAddress.slice(0, 8)}...${freighterAddress.slice(-6)}`
-                      : 'Connect your own Freighter wallet extension'}
-                  </div>
-                </button>
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    disabled={isFundingWallet}
+                    onClick={() => void handleFundCurrentWallet()}
+                    className="w-full py-2 px-3 border border-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-emerald-950 text-xs font-mono font-semibold uppercase tracking-wider cursor-pointer"
+                  >
+                    {isFundingWallet
+                      ? 'Requesting 10,000 Testnet XLM from Friendbot...'
+                      : '+ Get 10,000 Free Testnet XLM (Stellar Friendbot)'}
+                  </button>
+                </div>
 
                 <div className="pt-2 border-t border-stone-200 flex items-center justify-between font-mono text-xs">
-                  <span className="text-stone-500">Live Smart Contract</span>
+                  <span className="text-stone-500">Soroban Registry Contract</span>
                   <a
                     href={contractExplorerUrl}
                     target="_blank"
@@ -702,30 +776,35 @@ export function App() {
               </div>
             </div>
             <span
-              className={`font-mono text-[11px] font-bold px-2 py-0.5 border shrink-0 ${
+              className={`font-mono text-[11px] font-bold px-2.5 py-1 border shrink-0 ${
                 issuerLedger
                   ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
                   : 'bg-amber-50 text-amber-900 border-amber-300'
               }`}
             >
-              {issuerLedger ? '✓ Loaded' : 'Start Here'}
+              {issuerLedger ? '✓ 1. Loaded' : '1. Start Here'}
             </span>
           </button>
 
           {/* STEP 2 PILL */}
           <button
             type="button"
-            onClick={() => setActiveTab('issuer')}
+            onClick={() => {
+              setActiveTab('issuer');
+              if (issuerLedger && !isCompanySealed && !isNotarizing) {
+                void handleNotarizeOnSoroban();
+              }
+            }}
             className={`p-3 border text-left transition cursor-pointer flex items-center justify-between gap-3 ${
               activeTab === 'issuer' && issuerLedger && !isCompanySealed
-                ? 'bg-white border-stone-950 border-2 shadow-xs'
+                ? 'bg-amber-50/90 border-stone-950 border-2 shadow-sm'
                 : isCompanySealed
                 ? 'bg-white border-stone-300 hover:border-stone-900'
                 : 'bg-[#FAF8F5] border-stone-300'
             }`}
           >
             <div>
-              <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-stone-500">
+              <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-stone-600">
                 STEP 2 · ROLE: COMPANY (SENDER)
               </div>
               <div className="text-xs sm:text-sm font-bold text-stone-950 mt-0.5">
@@ -733,7 +812,7 @@ export function App() {
               </div>
             </div>
             <span
-              className={`font-mono text-[11px] font-bold px-2 py-0.5 border shrink-0 ${
+              className={`font-mono text-[11px] font-bold px-2.5 py-1 border shrink-0 ${
                 isCompanySealed
                   ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
                   : issuerLedger
@@ -741,10 +820,12 @@ export function App() {
                   : 'bg-stone-100 text-stone-500 border-stone-300'
               }`}
             >
-              {isCompanySealed
-                ? '✓ Sealed'
+              {isNotarizing
+                ? 'Sealing...'
+                : isCompanySealed
+                ? '✓ 2. Sealed'
                 : issuerLedger
-                ? 'Ready to Seal'
+                ? '→ Click to Seal'
                 : 'Waiting'}
             </span>
           </button>
@@ -762,6 +843,8 @@ export function App() {
             className={`p-3 border text-left transition cursor-pointer flex items-center justify-between gap-3 ${
               activeTab === 'auditor'
                 ? 'bg-white border-stone-950 border-2 shadow-xs'
+                : isCompanySealed
+                ? 'bg-emerald-50/60 border-emerald-800 border-2'
                 : 'bg-[#FAF8F5] border-stone-300 hover:border-stone-900'
             }`}
           >
@@ -774,21 +857,29 @@ export function App() {
               </div>
             </div>
             <span
-              className={`font-mono text-[11px] font-bold px-2 py-0.5 border shrink-0 ${
+              className={`font-mono text-[11px] font-bold px-2.5 py-1 border shrink-0 ${
                 verificationResult?.status === 'TAMPERED_PERIOD_MISMATCH'
                   ? 'bg-red-700 text-white border-red-700'
                   : verificationResult?.status === 'EXACT_MATCH' ||
                     verificationResult?.status === 'CANONICAL_MERKLE_MATCH'
                   ? 'bg-emerald-50 text-emerald-900 border-emerald-300'
-                  : 'bg-stone-100 text-stone-700 border-stone-300'
+                  : verificationResult?.status === 'NOT_FOUND'
+                  ? 'bg-amber-50 text-amber-900 border-amber-300'
+                  : isCompanySealed
+                  ? 'bg-emerald-800 text-white border-emerald-800'
+                  : 'bg-stone-100 text-stone-500 border-stone-300'
               }`}
             >
               {verificationResult?.status === 'TAMPERED_PERIOD_MISMATCH'
                 ? '✕ Edit Caught'
                 : verificationResult?.status === 'EXACT_MATCH' ||
                   verificationResult?.status === 'CANONICAL_MERKLE_MATCH'
-                ? '✓ Verified'
-                : 'Verify File'}
+                ? '✓ 3. Verified'
+                : verificationResult?.status === 'NOT_FOUND'
+                ? 'Not Sealed Yet'
+                : isCompanySealed
+                ? '→ Go to Step 3'
+                : 'Do Step 2 First'}
             </span>
           </button>
         </div>
@@ -803,13 +894,13 @@ export function App() {
           <div className="bg-white border border-[#D8D4CA] p-6 sm:p-8 space-y-6">
             <div className="max-w-3xl space-y-2">
               <div className="text-xs font-mono font-bold uppercase tracking-widest text-emerald-800">
-                WHY AUDITLEDGER EXISTS · ZERO-KNOWLEDGE DOCUMENT INTEGRITY
+                WHY AUDITLEDGER EXISTS · TAMPER-PROOF DOCUMENT SEAL ON STELLAR
               </div>
               <h1 className="font-serif-editorial text-3xl sm:text-5xl text-stone-950 leading-tight">
                 How do you prove a spreadsheet or PDF wasn&apos;t secretly edited after it was sent?
               </h1>
               <p className="text-sm sm:text-base text-stone-600 leading-relaxed">
-                When a company emails an Excel/CSV report or PDF contract to an external auditor, investor, or bank, anyone along the way can silently change a number. AuditLedger solves this in <strong>two simple views</strong> using the <strong>Stellar Blockchain</strong>:
+                When a company emails a CSV report, Excel export, or PDF contract to an external auditor, client, or investor, anyone along the way can silently change a row. AuditLedger solves this in <strong>two simple roles</strong> using the <strong>Stellar Blockchain</strong>:
               </p>
             </div>
 
@@ -825,24 +916,24 @@ export function App() {
               >
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-stone-950 text-white">
-                    Section 1 · Company (Sender)
+                    Role 1 · Company (Sender)
                   </span>
                   <span className="text-xs font-mono text-stone-500">
                     Steps 1 &amp; 2
                   </span>
                 </div>
                 <h2 className="text-lg font-bold text-stone-950 pt-1">
-                  Freeze &amp; Lock the Original Document
+                  Freeze &amp; Seal the Original Document on Stellar
                 </h2>
                 <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
-                  <strong>Who uses this:</strong> The Company, Finance Team, or Creator before sharing a file. You upload your CSV or PDF here. Your browser computes a unique digital fingerprint for every row and locks the master seal on Stellar. <strong>Zero private data ever leaves your computer.</strong>
+                  <strong>Who uses this:</strong> The Company or Creator before sending an important file. You upload your CSV or PDF here and click <strong>Lock &amp; Seal on Stellar</strong>. Your browser creates a digital fingerprint for every row and locks the Master Seal on Stellar. <strong>Zero private data ever leaves your computer.</strong>
                 </p>
               </div>
 
               {/* Arrow Connector */}
               <div className="lg:col-span-1 flex flex-col items-center justify-center text-center py-2">
                 <span className="text-xs font-mono uppercase tracking-wider text-stone-500">
-                  Then send file via Email
+                  Send File + Certificate
                 </span>
                 <span className="text-2xl font-bold text-stone-900 mt-1">
                   ➔
@@ -860,17 +951,17 @@ export function App() {
               >
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-mono font-bold uppercase tracking-wider px-2 py-0.5 bg-emerald-900 text-white">
-                    Section 2 · Auditor / Client (Receiver)
+                    Role 2 · Auditor / Client (Receiver)
                   </span>
                   <span className="text-xs font-mono text-stone-500">
                     Step 3 (Free Check)
                   </span>
                 </div>
                 <h2 className="text-lg font-bold text-stone-950 pt-1">
-                  Verify Authenticity &amp; Pinpoint Any Changed Row
+                  Verify the Received File &amp; Catch Any Modified Row
                 </h2>
                 <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
-                  <strong>Who uses this:</strong> The External Auditor, Client, Investor, or Regulator who receives the file. They drop the file here: AuditLedger checks the Stellar blockchain in 1 second and <strong>highlights in red the exact row and value</strong> if someone altered even a single character!
+                  <strong>Who uses this:</strong> The External Auditor, Client, or Investor who receives the file. They drop the file here: AuditLedger checks the Stellar seal in 1 second and <strong>highlights in red the exact row and value</strong> if someone altered even a single character!
                 </p>
               </div>
             </div>
@@ -892,26 +983,26 @@ export function App() {
           >
             <div className="inline-block px-3 py-1 bg-stone-100 border border-stone-300 text-xs font-mono font-bold uppercase tracking-wider text-stone-800">
               {activeTab === 'issuer'
-                ? 'CURRENT VIEW: SECTION 1 · COMPANY (SEAL YOUR FILE)'
-                : 'CURRENT VIEW: SECTION 2 · AUDITOR / CLIENT (VERIFY A FILE)'}
+                ? 'STEP 1 OF 3 · COMPANY VIEW (UPLOAD FILE TO SEAL)'
+                : 'STEP 3 OF 3 · AUDITOR / CLIENT VIEW (UPLOAD FILE TO VERIFY)'}
             </div>
 
             <h2 className="font-serif-editorial text-3xl sm:text-4xl text-stone-950">
               {activeTab === 'issuer'
-                ? 'Drag & Drop Any CSV or PDF Here to Begin'
-                : 'Drag & Drop a File Here to Check If It Was Altered'}
+                ? 'Drag & Drop Any CSV or PDF Here to Start Step 1'
+                : 'Drag & Drop a File Here to Verify It Against Stellar'}
             </h2>
 
             <p className="text-sm text-stone-600 max-w-xl mx-auto leading-relaxed">
               {activeTab === 'issuer'
-                ? 'Select 1 file or multiple files in bulk from your computer. Every row will be indexed locally so you can seal it on the Stellar blockchain in 1 click.'
-                : 'Upload the file you want to verify against the Stellar blockchain, or switch to Section 1 first to seal a file from your PC.'}
+                ? 'Select 1 file or multiple files in bulk from your computer. Every row will be indexed locally in your browser so you can lock its digital seal on Stellar in Step 2.'
+                : 'Upload the file you received to check if it matches the Stellar blockchain seal, or switch to Role 1 (Company) first to seal a file from your PC.'}
             </p>
 
             <div className="pt-2">
               {activeTab === 'issuer' ? (
                 <label className="inline-block py-4 px-8 bg-stone-950 hover:bg-stone-800 text-white text-base font-semibold tracking-wide cursor-pointer transition shadow-sm">
-                  <span>+ Choose CSV or PDF File(s) from Your Computer</span>
+                  <span>+ Select CSV or PDF File(s) from Your Computer</span>
                   <input
                     type="file"
                     multiple
@@ -923,7 +1014,7 @@ export function App() {
               ) : (
                 <div className="space-y-4">
                   <label className="inline-block py-4 px-8 bg-stone-950 hover:bg-stone-800 text-white text-base font-semibold tracking-wide cursor-pointer transition shadow-sm">
-                    <span>+ Choose File from Your Computer to Verify</span>
+                    <span>+ Select File from Your Computer to Verify</span>
                     <input
                       type="file"
                       accept=".csv,.txt,.json,.pdf"
@@ -939,14 +1030,7 @@ export function App() {
                         onClick={() => void handleProceedToAuditorStep3(false)}
                         className="px-4 py-2.5 border border-stone-900 bg-white hover:bg-stone-100 text-xs font-semibold uppercase tracking-wider text-stone-900 cursor-pointer"
                       >
-                        Verify the File You Loaded in Section 1 ({issuerLedger.fileName})
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleProceedToAuditorStep3(true)}
-                        className="px-4 py-2.5 border border-red-700 bg-red-50 hover:bg-red-100 text-xs font-semibold uppercase tracking-wider text-red-800 cursor-pointer"
-                      >
-                        Simulate Someone Editing {issuerLedger.fileName}
+                        Check the File Loaded in Step 1 ({issuerLedger.fileName})
                       </button>
                     </div>
                   )}
@@ -965,32 +1049,34 @@ export function App() {
           ACTIVE WORKSPACE: LEFT = TABLE, RIGHT = BLOCKCHAIN SEAL
          ========================================================= */}
       {activeLedger && (
-        <main className="flex-1 max-w-[1440px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 no-print">
+        <main className="flex-1 max-w-[1440px] w-full mx-auto grid grid-cols-1 lg:grid-cols-12 items-start no-print">
           {/* =====================================================
-              LEFT 8 COLS: EXTRACTED DOCUMENT ROWS & INTERACTIVE TABLE
+              LEFT 8 COLS: GUIDED ACTION BANNER + READ-ONLY TABLE
              ===================================================== */}
           <section className="lg:col-span-8 border-b lg:border-b-0 lg:border-r border-[#D8D4CA] flex flex-col bg-white">
             {/* Document Title & Upload Button */}
-            <div className="px-6 sm:px-8 py-6 border-b border-[#D8D4CA] bg-[#FAF8F5] space-y-4">
+            <div className="px-6 sm:px-8 py-6 border-b border-[#D8D4CA] bg-[#FAF8F5] space-y-5">
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <div className="text-xs font-mono uppercase tracking-wider text-stone-600 font-bold">
                     {activeTab === 'issuer'
-                      ? `SECTION 1 · COMPANY (SENDER) · ${activeLedger.fileName}`
-                      : `SECTION 2 · EXTERNAL AUDITOR (RECEIVER) · ${activeLedger.fileName}`}
+                      ? `ROLE 1 · COMPANY (SENDER) · ${activeLedger.fileName}`
+                      : `ROLE 2 · AUDITOR / CLIENT (RECEIVER) · ${activeLedger.fileName}`}
                   </div>
                   <h1 className="font-serif-editorial text-3xl sm:text-4xl text-stone-950 mt-1">
                     {activeTab === 'issuer'
                       ? activeLedger.fileName
                       : verificationResult?.status === 'TAMPERED_PERIOD_MISMATCH'
-                      ? `Tampering Caught in ${activeLedger.fileName}`
+                      ? `Modified Data Caught in ${activeLedger.fileName}`
+                      : verificationResult?.status === 'NOT_FOUND'
+                      ? `Not Sealed Yet: ${activeLedger.fileName}`
                       : `Verified Authentic: ${activeLedger.fileName}`}
                   </h1>
                 </div>
 
                 {/* Upload Another File Button */}
                 {activeTab === 'issuer' ? (
-                  <label className="px-4 py-2.5 border-2 border-stone-950 bg-stone-950 hover:bg-stone-800 text-white text-xs sm:text-sm font-semibold cursor-pointer">
+                  <label className="px-4 py-2.5 border border-stone-400 bg-white hover:bg-stone-100 text-stone-900 text-xs sm:text-sm font-semibold cursor-pointer">
                     <span>+ Upload Different File(s)</span>
                     <input
                       type="file"
@@ -1001,8 +1087,8 @@ export function App() {
                     />
                   </label>
                 ) : (
-                  <label className="px-4 py-2.5 border-2 border-stone-950 bg-stone-950 hover:bg-stone-800 text-white text-xs sm:text-sm font-semibold cursor-pointer">
-                    <span>+ Upload Another File to Verify</span>
+                  <label className="px-4 py-2.5 border border-stone-400 bg-white hover:bg-stone-100 text-stone-900 text-xs sm:text-sm font-semibold cursor-pointer">
+                    <span>+ Upload File from PC to Verify</span>
                     <input
                       type="file"
                       accept=".csv,.txt,.json,.pdf"
@@ -1013,59 +1099,210 @@ export function App() {
                 )}
               </div>
 
-              {/* In Auditor Mode: Interactive Fraud & Tamper Playground Banner */}
-              {activeTab === 'auditor' && (
-                <div className="p-4 border-2 border-stone-900 bg-white space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <span className="text-xs font-mono font-bold uppercase tracking-wider text-red-800 block">
-                        ★ INTERACTIVE TAMPER DETECTOR (TRY IT LIVE)
-                      </span>
-                      <span className="text-sm font-bold text-stone-950">
-                        Test what happens if someone alters a row after sealing on Stellar:
-                      </span>
+              {/* =========================================================
+                  STATE 1: COMPANY UPLOADED FILE, NOT SEALED YET -> DO STEP 2!
+                 ========================================================= */}
+              {activeTab === 'issuer' && !currentSealedRecord && (
+                <div className="border-2 border-stone-950 bg-amber-50/90 p-5 space-y-3 shadow-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div className="space-y-1 max-w-xl">
+                      <div className="text-xs font-mono font-bold uppercase tracking-wider text-amber-900">
+                        ✓ STEP 1 COMPLETE ({activeLedger.rows.length} ROWS READ LOCALLY) · NEXT REQUIRED ACTION:
+                      </div>
+                      <h2 className="text-lg sm:text-xl font-bold text-stone-950">
+                        Step 2: Click the Button to Lock &amp; Seal This File on Stellar
+                      </h2>
+                      <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
+                        Your file is loaded in your browser, but it is <strong>not sealed on the blockchain yet</strong>. Click the button to record its tamper-proof digital fingerprint on Stellar so you can download your <strong>Official Seal Certificate</strong> and unlock <strong>Step 3 (Auditor Verification)</strong>.
+                      </p>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2">
+
+                    <button
+                      type="button"
+                      disabled={isNotarizing}
+                      onClick={() => void handleNotarizeOnSoroban()}
+                      className="py-4 px-7 bg-stone-950 hover:bg-stone-800 disabled:bg-stone-400 text-white text-sm sm:text-base font-bold tracking-wide cursor-pointer shadow-md shrink-0"
+                    >
+                      {isNotarizing
+                        ? notarizeStep || 'Sealing on Stellar...'
+                        : 'Step 2: Lock & Seal on Stellar Now →'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* =========================================================
+                  STATE 2: COMPANY SEALED FILE -> WHAT DO I DO NOW? (2 CLEAR OPTIONS)
+                 ========================================================= */}
+              {activeTab === 'issuer' && currentSealedRecord && (
+                <div className="border-2 border-emerald-800 bg-emerald-50/90 p-5 space-y-4 shadow-xs">
+                  <div className="space-y-1">
+                    <div className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-900">
+                      ✓ STEP 2 COMPLETE · THIS FILE IS PERMANENTLY SEALED ON STELLAR!
+                    </div>
+                    <h2 className="text-lg sm:text-xl font-bold text-stone-950">
+                      Your file is sealed! Here is what you do next:
+                    </h2>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Option A: Real-World Deliverable */}
+                    <div className="bg-white border border-emerald-700 p-4 space-y-2.5">
+                      <div className="text-xs font-mono font-bold uppercase text-stone-600">
+                        1. IN REAL LIFE · SAVE YOUR SEAL CERTIFICATE
+                      </div>
+                      <p className="text-xs text-stone-700 leading-relaxed">
+                        Open your <strong>Official Blockchain Seal Certificate</strong> (with QR code &amp; Stellar transaction proof) to attach when sending this file to your client, bank, or auditor:
+                      </p>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCertificateRecord({
+                              record: currentSealedRecord,
+                              txHash:
+                                lastNotarization?.txHash || DEPLOY_CONFIG.initialTxHash,
+                              fileName: activeLedger.fileName,
+                              totalFormatted: formatCentsToEur(
+                                activeLedger.totalDebitCents
+                              ),
+                            })
+                          }
+                          className="px-3.5 py-2 bg-stone-950 hover:bg-stone-800 text-white text-xs font-semibold uppercase tracking-wider cursor-pointer"
+                        >
+                          Open Printable Seal Certificate
+                        </button>
+                        <a
+                          href={latestTxUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="px-3 py-2 border border-stone-400 bg-[#FAF8F5] hover:bg-stone-100 text-stone-900 text-xs font-semibold uppercase tracking-wider"
+                        >
+                          View Stellar TX ↗
+                        </a>
+                      </div>
+                    </div>
+
+                    {/* Option B: Test Receiver / Auditor View */}
+                    <div className="bg-white border border-emerald-700 p-4 space-y-2.5">
+                      <div className="text-xs font-mono font-bold uppercase text-emerald-900">
+                        2. IN THIS DEMO · GO TO STEP 3 (AUDITOR / RECEIVER VIEW)
+                      </div>
+                      <p className="text-xs text-stone-700 leading-relaxed">
+                        Switch to <strong>Role 2 (Auditor / Client)</strong> to see how the receiver verifies your file - and test what happens if someone secretly changes 1 row!
+                      </p>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => void handleProceedToAuditorStep3(false)}
+                          className="px-3.5 py-2 bg-emerald-800 hover:bg-emerald-900 text-white text-xs font-semibold uppercase tracking-wider cursor-pointer"
+                        >
+                          Go to Step 3: Verify Authentic File →
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleProceedToAuditorStep3(true)}
+                          className="px-3.5 py-2 border border-red-700 bg-red-50 hover:bg-red-100 text-red-900 text-xs font-semibold uppercase tracking-wider cursor-pointer"
+                        >
+                          Test With a Modified Row →
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* =========================================================
+                  STATE 3: AUDITOR VIEW WHEN FILE WAS NOT SEALED IN STEP 2 YET!
+                 ========================================================= */}
+              {activeTab === 'auditor' &&
+                verificationResult?.status === 'NOT_FOUND' && (
+                  <div className="border-2 border-amber-700 bg-amber-50 p-5 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      <div className="space-y-1 max-w-xl">
+                        <div className="text-xs font-mono font-bold uppercase tracking-wider text-amber-900">
+                          ! STEP 2 WAS SKIPPED · THIS FILE IS NOT SEALED ON STELLAR YET
+                        </div>
+                        <h2 className="text-lg font-bold text-stone-950">
+                          No Blockchain Seal Found for &quot;{activeLedger.fileName}&quot;
+                        </h2>
+                        <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
+                          An Auditor cannot verify this file yet because the Company hasn&apos;t sealed it on the Stellar blockchain in <strong>Step 2</strong>. Click the button to go back to <strong>Role 1 (Company)</strong> and seal it first!
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('issuer')}
+                        className="py-3.5 px-6 bg-stone-950 hover:bg-stone-800 text-white text-xs sm:text-sm font-bold uppercase tracking-wider cursor-pointer shrink-0"
+                      >
+                        ← Go Back to Step 2 &amp; Seal File First
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+              {/* =========================================================
+                  STATE 4: AUDITOR VIEW WHEN FILE IS SEALED -> CLEAN 3-BUTTON TEST BAR
+                 ========================================================= */}
+              {activeTab === 'auditor' &&
+                verificationResult &&
+                verificationResult.status !== 'NOT_FOUND' && (
+                  <div className="p-5 border-2 border-stone-950 bg-white space-y-3">
+                    <div className="space-y-1">
+                      <span className="text-xs font-mono font-bold uppercase tracking-wider text-stone-600 block">
+                        STEP 3 OF 3 · AUDITOR VERIFICATION &amp; TAMPER TEST
+                      </span>
+                      <h2 className="text-base sm:text-lg font-bold text-stone-950">
+                        Compare the Original Sealed File vs. a File Where Someone Secretly Changed 1 Row:
+                      </h2>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2.5 pt-1">
                       <button
                         type="button"
                         onClick={() => void handleProceedToAuditorStep3(false)}
-                        className={`px-3.5 py-2 border text-xs font-semibold uppercase tracking-wider cursor-pointer ${
+                        className={`px-4 py-2.5 border text-xs font-semibold uppercase tracking-wider cursor-pointer ${
                           auditorScenario !== 'tampered_fraud'
-                            ? 'border-stone-950 bg-stone-950 text-white'
+                            ? 'border-emerald-800 bg-emerald-800 text-white'
                             : 'border-stone-400 bg-white text-stone-900 hover:bg-stone-100'
                         }`}
                       >
-                        1. Restore Original File
+                        1. Check Original File (✓ 100% Authentic)
                       </button>
+
                       <button
                         type="button"
                         onClick={() => void handleProceedToAuditorStep3(true)}
-                        className={`px-3.5 py-2 border text-xs font-semibold uppercase tracking-wider cursor-pointer ${
+                        className={`px-4 py-2.5 border text-xs font-semibold uppercase tracking-wider cursor-pointer ${
                           auditorScenario === 'tampered_fraud'
                             ? 'border-red-800 bg-red-800 text-white'
                             : 'border-red-700 bg-red-50 text-red-900 hover:bg-red-100'
                         }`}
                       >
-                        2. Auto-Simulate Fraud on 1 Row
+                        2. Test With a Modified File (Row #4 Changed)
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDownloadModifiedCsvCopy}
+                        className="px-4 py-2.5 border border-stone-400 bg-[#FAF8F5] hover:bg-stone-100 text-stone-900 text-xs font-semibold uppercase tracking-wider cursor-pointer"
+                      >
+                        3. Download Modified CSV to Your PC (.csv)
                       </button>
                     </div>
                   </div>
-                  <p className="text-xs text-stone-600 border-t border-stone-200 pt-2">
-                    <strong>Tip:</strong> You can also click the <strong>&quot;Edit Row&quot;</strong> button on <em>any</em> row in the table below to type your own fake change and watch the Stellar seal catch it in real time!
-                  </p>
-                </div>
-              )}
+                )}
             </div>
 
             {/* Summary Metrics Strip */}
             <div className="grid grid-cols-1 sm:grid-cols-3 border-b border-[#D8D4CA] divide-y sm:divide-y-0 sm:divide-x divide-[#D8D4CA] bg-white">
-              <div className="px-6 sm:px-8 py-5">
+              <div className="px-6 sm:px-8 py-4">
                 <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
                   {activeLedger.documentMode === 'accounting_gl'
                     ? 'Total Debits'
                     : 'Protected Rows'}
                 </div>
-                <div className="font-mono text-2xl sm:text-3xl font-bold text-stone-950 mt-1">
+                <div className="font-mono text-2xl font-bold text-stone-950 mt-1">
                   {activeLedger.documentMode === 'accounting_gl'
                     ? formatCentsToEur(activeLedger.totalDebitCents)
                     : `${activeLedger.rows.length} ${
@@ -1074,13 +1311,13 @@ export function App() {
                 </div>
               </div>
 
-              <div className="px-6 sm:px-8 py-5">
+              <div className="px-6 sm:px-8 py-4">
                 <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
                   {activeLedger.documentMode === 'accounting_gl'
                     ? 'Total Credits'
                     : 'File Size'}
                 </div>
-                <div className="font-mono text-2xl sm:text-3xl font-bold text-stone-950 mt-1">
+                <div className="font-mono text-2xl font-bold text-stone-950 mt-1">
                   {activeLedger.documentMode === 'accounting_gl'
                     ? formatCentsToEur(activeLedger.totalCreditCents)
                     : activeLedger.fileSizeBytes >= 1048576
@@ -1089,34 +1326,36 @@ export function App() {
                 </div>
               </div>
 
-              <div className="px-6 sm:px-8 py-5 flex flex-col justify-between">
+              <div className="px-6 sm:px-8 py-4 flex flex-col justify-between">
                 <div className="text-xs font-semibold uppercase tracking-wider text-stone-500">
-                  Row-by-Row Protection Map
+                  Row Integrity Status
                 </div>
                 <div className="flex flex-wrap items-center justify-between gap-2 mt-1">
                   <span
-                    className={`font-mono text-xl sm:text-2xl font-bold whitespace-nowrap ${
+                    className={`font-mono text-xl font-bold whitespace-nowrap ${
                       tamperXRay && tamperXRay.modifiedRows.length > 0
                         ? 'text-red-700'
                         : 'text-emerald-800'
                     }`}
                   >
                     {tamperXRay && tamperXRay.modifiedRows.length > 0
-                      ? `${tamperXRay.modifiedRows.length} Modified`
-                      : `${activeLedger.rows.length} Intact`}
+                      ? `${tamperXRay.modifiedRows.length} Row Modified`
+                      : `${activeLedger.rows.length} Rows Intact`}
                   </span>
                   <button
                     type="button"
                     onClick={() => setShowMerkleTopology((prev) => !prev)}
                     className="px-2.5 py-1 border border-stone-400 bg-[#FAF8F5] hover:bg-stone-100 text-xs font-mono font-semibold text-stone-900 whitespace-nowrap cursor-pointer"
                   >
-                    {showMerkleTopology ? 'Hide Visual Map' : 'Show Visual Map'}
+                    {showMerkleTopology
+                      ? 'Hide Privacy Info'
+                      : 'How Privacy Works'}
                   </button>
                 </div>
               </div>
             </div>
 
-            {/* Expandable Visual Row-by-Row Protection Map */}
+            {/* Expandable 3-Card "How Privacy & Row-by-Row Protection Work" */}
             {showMerkleTopology && (
               <MerkleTreeVisualizer
                 ledger={activeLedger}
@@ -1128,7 +1367,7 @@ export function App() {
             )}
 
             {/* Table Header & Search Bar */}
-            <div className="px-6 sm:px-8 py-3.5 border-b border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-4">
+            <div className="px-6 sm:px-8 py-3 border-b border-[#D8D4CA] bg-[#FAF8F5] flex flex-wrap items-center justify-between gap-4">
               <span className="text-xs font-semibold uppercase tracking-wider text-stone-600">
                 {activeLedger.documentMode === 'accounting_gl'
                   ? `Extracted Accounting Rows (${filteredRows.length})`
@@ -1143,25 +1382,23 @@ export function App() {
               />
             </div>
 
-            {/* High-Contrast Data Table */}
-            <div className="overflow-x-auto flex-1 bg-white">
+            {/* Clean Read-Only Data Table */}
+            <div className="overflow-x-auto overflow-y-auto max-h-[520px] bg-white">
               <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-[#D8D4CA] bg-stone-100/80 text-xs font-semibold uppercase tracking-wider text-stone-700">
-                    <th className="py-3.5 px-4 w-12">#</th>
-                    <th className="py-3.5 px-4">Row ID</th>
-                    <th className="py-3.5 px-4">Content / Description</th>
+                <thead className="sticky top-0 z-10 bg-stone-100 border-b border-[#D8D4CA]">
+                  <tr className="text-xs font-semibold uppercase tracking-wider text-stone-700">
+                    <th className="py-3 px-4 w-12">#</th>
+                    <th className="py-3 px-4">Row ID</th>
+                    <th className="py-3 px-4">Content / Description</th>
                     {activeLedger.documentMode === 'accounting_gl' ? (
                       <>
-                        <th className="py-3.5 px-4 text-right">Debit (EUR)</th>
-                        <th className="py-3.5 px-4 text-right">Credit (EUR)</th>
+                        <th className="py-3 px-4 text-right">Debit (EUR)</th>
+                        <th className="py-3 px-4 text-right">Credit (EUR)</th>
                       </>
                     ) : (
-                      <th className="py-3.5 px-4 text-right">Row Digital Seal</th>
+                      <th className="py-3 px-4 text-right">Row Digital Lock</th>
                     )}
-                    <th className="py-3.5 px-4 text-right">
-                      {activeTab === 'auditor' ? 'Status / Live Test' : 'Status'}
-                    </th>
+                    <th className="py-3 px-4 text-right">Row Check</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-200 text-sm">
@@ -1169,7 +1406,6 @@ export function App() {
                     const diff = diffByRowIndex.get(row.rowIndex);
                     const isTampered = Boolean(diff);
                     const isSelected = row.rowIndex === selectedProofRowIndex;
-                    const isEditingThisRow = editingRowIndex === row.rowIndex;
 
                     return (
                       <tr
@@ -1183,11 +1419,11 @@ export function App() {
                             : 'hover:bg-stone-50'
                         }`}
                       >
-                        <td className="py-4 px-4 font-mono text-stone-500">
+                        <td className="py-3.5 px-4 font-mono text-stone-500">
                           {String(row.rowIndex).padStart(2, '0')}
                         </td>
 
-                        <td className="py-4 px-4 whitespace-nowrap">
+                        <td className="py-3.5 px-4 whitespace-nowrap">
                           <div className="font-mono font-semibold text-stone-950">
                             {row.entryId}
                           </div>
@@ -1196,7 +1432,7 @@ export function App() {
                           </div>
                         </td>
 
-                        <td className="py-4 px-4">
+                        <td className="py-3.5 px-4">
                           <div className="font-semibold text-stone-950">
                             <span className="font-mono text-stone-500 mr-2">
                               [{row.accountCode}]
@@ -1204,44 +1440,13 @@ export function App() {
                             <span>{row.accountName}</span>
                           </div>
 
-                          {isEditingThisRow ? (
-                            <div
-                              onClick={(e) => e.stopPropagation()}
-                              className="mt-2 flex flex-wrap items-center gap-2"
-                            >
-                              <input
-                                type="text"
-                                value={editingRowValue}
-                                onChange={(e) => setEditingRowValue(e.target.value)}
-                                placeholder={
-                                  activeLedger.documentMode === 'accounting_gl'
-                                    ? 'Enter new EUR amount (e.g. 99500)...'
-                                    : 'Type modified text for this row...'
-                                }
-                                className="px-2.5 py-1.5 text-xs font-mono bg-white border-2 border-stone-950 text-stone-950 w-64"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => void handleApplyInlineRowEdit(row.rowIndex)}
-                                className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white text-xs font-mono font-bold uppercase cursor-pointer"
-                              >
-                                Apply Fake Edit
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setEditingRowIndex(null)}
-                                className="px-2.5 py-1.5 border border-stone-400 bg-white text-stone-700 text-xs font-mono uppercase cursor-pointer"
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          ) : isTampered && diff?.field === 'Row Content' ? (
-                            <div className="mt-1 space-y-0.5 font-mono text-xs">
+                          {isTampered && diff?.field === 'Row Content' ? (
+                            <div className="mt-1.5 p-2 bg-white border border-red-300 space-y-1 font-mono text-xs">
                               <div className="line-through text-stone-500">
-                                Sealed Original: {diff.sealedValue}
+                                Original Sealed Row: {diff.sealedValue}
                               </div>
                               <div className="font-bold text-red-700">
-                                Modified To: {diff.uploadedValue}
+                                Modified Row Found: {diff.uploadedValue}
                               </div>
                             </div>
                           ) : (
@@ -1253,7 +1458,7 @@ export function App() {
 
                         {activeLedger.documentMode === 'accounting_gl' ? (
                           <>
-                            <td className="py-4 px-4 font-mono text-right whitespace-nowrap text-base">
+                            <td className="py-3.5 px-4 font-mono text-right whitespace-nowrap text-base">
                               {isTampered && diff?.field === 'Debit Amount' ? (
                                 <div className="flex flex-col items-end">
                                   <span className="line-through text-stone-500 text-xs">
@@ -1275,7 +1480,7 @@ export function App() {
                               )}
                             </td>
 
-                            <td className="py-4 px-4 font-mono text-right whitespace-nowrap text-base">
+                            <td className="py-3.5 px-4 font-mono text-right whitespace-nowrap text-base">
                               {isTampered && diff?.field === 'Credit Amount' ? (
                                 <div className="flex flex-col items-end">
                                   <span className="line-through text-stone-500 text-xs">
@@ -1298,46 +1503,21 @@ export function App() {
                             </td>
                           </>
                         ) : (
-                          <td className="py-4 px-4 font-mono text-right whitespace-nowrap text-xs text-stone-700">
+                          <td className="py-3.5 px-4 font-mono text-right whitespace-nowrap text-xs text-stone-700">
                             {row.leafHash.slice(0, 10)}...{row.leafHash.slice(-6)}
                           </td>
                         )}
 
-                        <td
-                          onClick={(e) => e.stopPropagation()}
-                          className="py-4 px-4 font-mono text-right whitespace-nowrap text-xs"
-                        >
-                          <div className="flex items-center justify-end gap-2">
-                            {isTampered ? (
-                              <span className="inline-block px-2.5 py-1 bg-red-700 text-white font-bold">
-                                MODIFIED ({diff?.deltaFormatted.replace('EUR ', '')})
-                              </span>
-                            ) : (
-                              <span className="text-emerald-800 font-semibold">
-                                ✓ Intact
-                              </span>
-                            )}
-
-                            {activeTab === 'auditor' && !isEditingThisRow && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setEditingRowIndex(row.rowIndex);
-                                  setEditingRowValue(
-                                    activeLedger.documentMode === 'accounting_gl'
-                                      ? String(
-                                          (row.debitCents || row.creditCents) / 100 +
-                                            5000
-                                        )
-                                      : `${row.description} [EDITED]`
-                                  );
-                                }}
-                                className="px-2 py-1 border border-stone-400 bg-white hover:bg-red-50 hover:border-red-700 hover:text-red-800 text-[11px] font-semibold text-stone-700 cursor-pointer"
-                              >
-                                Edit Row
-                              </button>
-                            )}
-                          </div>
+                        <td className="py-3.5 px-4 font-mono text-right whitespace-nowrap text-xs">
+                          {isTampered ? (
+                            <span className="inline-block px-2.5 py-1 bg-red-700 text-white font-bold">
+                              ✕ MODIFIED
+                            </span>
+                          ) : (
+                            <span className="text-emerald-800 font-semibold">
+                              ✓ Intact
+                            </span>
+                          )}
                         </td>
                       </tr>
                     );
@@ -1348,9 +1528,9 @@ export function App() {
           </section>
 
           {/* =====================================================
-              RIGHT 4 COLS: SIMPLE BLOCKCHAIN SEAL & VERDICT PANEL
+              RIGHT 4 COLS: STICKY BLOCKCHAIN SEAL & VERDICT PANEL
              ===================================================== */}
-          <aside className="lg:col-span-4 bg-[#F4F1EA] flex flex-col divide-y divide-[#D8D4CA]">
+          <aside className="lg:col-span-4 lg:sticky lg:top-16 bg-[#F4F1EA] flex flex-col divide-y divide-[#D8D4CA]">
             <div className="p-6 sm:p-8 space-y-6">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-mono font-bold uppercase tracking-wider text-stone-600">
@@ -1364,7 +1544,7 @@ export function App() {
                   rel="noreferrer"
                   className="text-xs font-mono font-semibold underline text-stone-800 hover:text-black whitespace-nowrap shrink-0"
                 >
-                  View on Stellar ↗
+                  View Contract on Stellar ↗
                 </a>
               </div>
 
@@ -1391,7 +1571,7 @@ export function App() {
                             : 'text-amber-900 bg-amber-50 border-amber-300'
                         }`}
                       >
-                        {currentSealedRecord ? 'LOCKED' : 'NOT SEALED YET'}
+                        {currentSealedRecord ? 'LOCKED ON-CHAIN' : 'NOT SEALED YET'}
                       </span>
                     </div>
 
@@ -1403,7 +1583,7 @@ export function App() {
                         </span>
                       </div>
                       <div className="flex justify-between gap-2">
-                        <span className="text-stone-600">Signed By</span>
+                        <span className="text-stone-600">Signed By Wallet</span>
                         <span className="font-mono text-stone-900">
                           {activeSignerPub.slice(0, 6)}...{activeSignerPub.slice(-6)}
                         </span>
@@ -1488,7 +1668,7 @@ export function App() {
                             onClick={() => void handleProceedToAuditorStep3(true)}
                             className="w-full py-2.5 px-3 bg-white hover:bg-red-50 text-red-800 border border-red-700 text-xs font-semibold uppercase tracking-wider cursor-pointer"
                           >
-                            Step 3B: Test What Happens If Someone Edits a Row →
+                            Step 3B: Test With a Modified File (Row #4 Changed) →
                           </button>
                         </div>
                       </div>
@@ -1505,6 +1685,8 @@ export function App() {
                           ? 'border-emerald-700'
                           : verificationResult.status === 'CANONICAL_MERKLE_MATCH'
                           ? 'border-sky-800'
+                          : verificationResult.status === 'NOT_FOUND'
+                          ? 'border-amber-700'
                           : 'border-red-700'
                       }`}
                     >
@@ -1515,6 +1697,8 @@ export function App() {
                               ? 'text-emerald-800'
                               : verificationResult.status === 'CANONICAL_MERKLE_MATCH'
                               ? 'text-sky-900'
+                              : verificationResult.status === 'NOT_FOUND'
+                              ? 'text-amber-800'
                               : 'text-red-700'
                           }`}
                         >
@@ -1525,7 +1709,7 @@ export function App() {
                           {verificationResult.status === 'TAMPERED_PERIOD_MISMATCH' &&
                             '✕ WARNING: FILE WAS MODIFIED'}
                           {verificationResult.status === 'NOT_FOUND' &&
-                            '! NOT SEALED YET'}
+                            '! NOT SEALED ON STELLAR YET'}
                         </div>
                         <h2 className="text-xl font-bold text-stone-950 mt-1">
                           {verificationResult.status === 'EXACT_MATCH' &&
@@ -1537,7 +1721,7 @@ export function App() {
                               tamperXRay?.modifiedRows.length || 1
                             } Row(s) Changed After Sealing`}
                           {verificationResult.status === 'NOT_FOUND' &&
-                            'No Seal Found for This File'}
+                            'Seal It in Step 2 First'}
                         </h2>
                       </div>
 
@@ -1768,7 +1952,7 @@ export function App() {
                   You Create &amp; Seal the File
                 </h3>
                 <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                  Before sending an important CSV spreadsheet or PDF to an external auditor, client, or investor, you upload it in <strong>Section 1</strong> and click <strong>Lock &amp; Seal on Stellar</strong>.
+                  Before sending an important CSV spreadsheet or PDF to an external auditor, client, or investor, you upload it in <strong>Section 1</strong> and click <strong>Step 2: Lock &amp; Seal on Stellar</strong>.
                 </p>
                 <p className="text-xs text-stone-600 leading-relaxed">
                   AuditLedger creates a digital fingerprint for every row and locks the master seal on the Stellar blockchain. Your private file never leaves your computer.
@@ -1793,17 +1977,17 @@ export function App() {
 
             <div className="p-4 bg-[#F4F1EA] border border-stone-300 space-y-2 text-xs sm:text-sm">
               <div className="font-bold text-stone-950">
-                How to Demo This Live in 30 Seconds:
+                How to Test the Complete Flow in 30 Seconds:
               </div>
               <ol className="list-decimal list-inside space-y-1 text-stone-700">
                 <li>
-                  In <strong>Section 1 (Company)</strong>, upload any CSV or PDF from your computer and click <strong>Step 2: Lock &amp; Seal Document on Stellar</strong>.
+                  In <strong>Role 1 (Company)</strong>, upload any CSV or PDF from your computer and click <strong>Step 2: Lock &amp; Seal on Stellar Now</strong>.
                 </li>
                 <li>
-                  Click <strong>Step 3A: Verify Original Untouched File</strong> to switch to <strong>Section 2 (Auditor)</strong> and see the green <strong>100% Authentic</strong> confirmation.
+                  Once sealed, open your <strong>Printable Seal Certificate</strong> (what you send to your client) OR click <strong>Go to Step 3: Verify Authentic File</strong>.
                 </li>
                 <li>
-                  Click <strong>Edit Row</strong> on any row in the table (or click <strong>Auto-Simulate Fraud</strong>) to change a value and watch the Stellar verification catch the exact row you modified!
+                  In <strong>Role 2 (Auditor)</strong>, click <strong>2. Test With a Modified File (Row #4 Changed)</strong> (or download the modified CSV to your PC and upload it) to see the blockchain check catch Row #4 in red!
                 </li>
               </ol>
             </div>
